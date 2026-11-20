@@ -1,17 +1,29 @@
 const std = @import("std");
 
 pub fn build(b: *std.Build) void {
+    // Freestanding (no libc) static PID 1 for the build host's architecture by
+    // default; cross-compile with e.g. -Dtarget=aarch64-linux-none.
+    // `.cpu_model = .baseline` keeps the portable baseline CPU feature set
+    // (an unset cpu_arch would otherwise mean "native", i.e. the host's CPU).
     const target = b.standardTargetOptions(.{
         .default_target = .{
-            .cpu_arch = .x86_64,
             .os_tag = .linux,
             .abi = .none,
+            .cpu_model = .baseline,
         },
     });
 
-    const optimize = b.standardOptimizeOption(.{
-        .preferred_optimize_mode = .ReleaseSafe,
+    // `-Drelease` / `--release` select ReleaseSafe; a plain `zig build` is a
+    // Debug build. With a preferred mode set, std.Build exposes no -Doptimize,
+    // so it is declared here too to allow picking any mode explicitly.
+    const release_optimize = b.standardOptimizeOption(.{
+        .preferred_optimize_mode = .safe,
     });
+    const optimize = b.option(
+        std.builtin.Optimize,
+        "optimize",
+        "Prioritize performance, safety, or binary size (overrides -Drelease)",
+    ) orelse release_optimize;
 
     const exe = b.addExecutable(.{
         .name = "dynamod-init",
@@ -28,9 +40,7 @@ pub fn build(b: *std.Build) void {
     const run_cmd = b.addRunArtifact(exe);
     run_step.dependOn(&run_cmd.step);
     run_cmd.step.dependOn(b.getInstallStep());
-    if (b.args) |args| {
-        run_cmd.addArgs(args);
-    }
+    run_cmd.addPassthruArgs();
 
     const exe_tests = b.addTest(.{
         .root_module = exe.root_module,

@@ -23,7 +23,7 @@ pub const ReapedChild = struct {
 
     pub fn termSignal(self: ReapedChild) ?u32 {
         if (linux.W.IFSIGNALED(self.status)) {
-            return linux.W.TERMSIG(self.status);
+            return @backingInt(linux.W.TERMSIG(self.status));
         }
         return null;
     }
@@ -35,9 +35,10 @@ pub const ReapedChild = struct {
 pub fn reapAll(klog: ?kmsg, callback: ?*const fn (ReapedChild) void) u32 {
     var count: u32 = 0;
     while (true) {
-        var status: u32 = 0;
-        const rc = linux.waitpid(-1, &status, linux.W.NOHANG);
-        const e = linux.E.init(rc);
+        var raw_status: i32 = 0;
+        const rc = linux.waitpid(-1, &raw_status, linux.W.NOHANG);
+        const e = linux.errno(rc);
+        const status: u32 = @bitCast(raw_status);
 
         if (e == .CHILD) break; // No more children
         if (e != .SUCCESS) break; // Other error

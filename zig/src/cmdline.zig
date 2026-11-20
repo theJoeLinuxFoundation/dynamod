@@ -6,6 +6,7 @@
 const std = @import("std");
 const constants = @import("constants.zig");
 const kmsg = @import("kmsg.zig");
+const sys = @import("sys.zig");
 
 pub const Cmdline = struct {
     buf: [4096]u8 = undefined,
@@ -14,13 +15,14 @@ pub const Cmdline = struct {
     /// Read and parse /proc/cmdline. Must be called after /proc is mounted.
     pub fn read(klog_arg: ?kmsg) Cmdline {
         var self = Cmdline{};
-        const file = std.fs.openFileAbsolute(constants.proc_cmdline_path, .{}) catch {
+        const file = sys.openFile(constants.proc_cmdline_path, .read_only) catch {
             if (klog_arg) |k| k.warn("cannot open {s}", .{constants.proc_cmdline_path});
             return self;
         };
-        defer file.close();
+        defer sys.close(file);
 
-        self.len = file.read(&self.buf) catch {
+        // A single read(2), as before: procfs returns the whole line at once.
+        self.len = sys.read(file, &self.buf) catch {
             if (klog_arg) |k| k.warn("cannot read {s}", .{constants.proc_cmdline_path});
             return self;
         };

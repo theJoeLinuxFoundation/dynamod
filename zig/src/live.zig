@@ -7,8 +7,9 @@ const cmdline = @import("cmdline.zig");
 const iso9660 = @import("iso9660.zig");
 const rootdev = @import("rootdev.zig");
 const switchroot = @import("switchroot.zig");
+const sys = @import("sys.zig");
 
-/// linux/loop.h
+/// linux/loop.h (plain numbers, not _IO()-encoded: identical on every arch)
 const LOOP_SET_FD: u32 = 0x4C00;
 const LOOP_CTL_GET_FREE: u32 = 0x4C82;
 
@@ -22,18 +23,16 @@ fn halt() noreturn {
 }
 
 fn kernelModuleTreePresent() bool {
-    var d = std.fs.openDirAbsolute("/lib/modules", .{}) catch return false;
-    defer d.close();
-    return true;
+    return sys.dirExists("/lib/modules");
 }
 
 /// Best-effort modprobe for modular kernels (ignores failure if busybox/kmod missing).
 fn tryModprobe(name: [*:0]const u8) void {
     const modprobe: [*:0]const u8 = "/bin/modprobe";
-    _ = std.fs.openFileAbsolute(std.mem.span(modprobe), .{}) catch return;
+    if (!sys.fileExists(std.mem.span(modprobe))) return;
 
     const pid_rc = linux.fork();
-    const pid_e = linux.E.init(pid_rc);
+    const pid_e = linux.errno(pid_rc);
     if (pid_e != .SUCCESS) return;
 
     if (pid_rc == 0) {
@@ -43,7 +42,7 @@ fn tryModprobe(name: [*:0]const u8) void {
         linux.exit(1);
     }
 
-    var status: u32 = 0;
+    var status: i32 = 0;
     _ = linux.wait4(@intCast(pid_rc), &status, 0, null);
 }
 
@@ -104,7 +103,7 @@ fn copyLiveSquashToTmpfs(src: [*:0]const u8, dst: [*:0]const u8, klog_arg: ?kmsg
     if (klog_arg) |k| k.infoLiteral("live: copy squash streaming (no stat)");
 
     const in_u = linux.open(src, .{ .ACCMODE = .RDONLY }, 0);
-    if (linux.E.init(in_u) != .SUCCESS) {
+    if (linux.errno(in_u) != .SUCCESS) {
         if (klog_arg) |k| k.emerg("dynamod live: open squashfs on media failed", .{});
         halt();
     }
@@ -112,7 +111,7 @@ fn copyLiveSquashToTmpfs(src: [*:0]const u8, dst: [*:0]const u8, klog_arg: ?kmsg
     defer _ = linux.close(in_fd);
 
     const out_u = linux.open(dst, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o600);
-    if (linux.E.init(out_u) != .SUCCESS) {
+    if (linux.errno(out_u) != .SUCCESS) {
         if (klog_arg) |k| k.emerg("dynamod live: open tmpfs squash copy for write failed", .{});
         halt();
     }
@@ -178,14 +177,14 @@ fn copySquashFromBlockDev(
 
     if (klog_arg) |k| k.infoLiteral("live: copy squash via block pread (skip iso9660 open)");
 
-    const in_fd = std.posix.openZ(dev_z, .{ .ACCMODE = .RDONLY, .NOCTTY = true }, 0) catch {
+    const in_fd = sys.openZ(dev_z, .{ .ACCMODE = .RDONLY, .NOCTTY = true }, 0) catch {
         if (klog_arg) |k| k.emerg("dynamod live: open block device for squash pread failed", .{});
         halt();
     };
-    defer std.posix.close(in_fd);
+    defer sys.close(in_fd);
 
     const out_u = linux.open(dst, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o600);
-    if (linux.E.init(out_u) != .SUCCESS) {
+    if (linux.errno(out_u) != .SUCCESS) {
         if (klog_arg) |k| k.emerg("dynamod live: open tmpfs squash copy for write failed", .{});
         halt();
     }
@@ -201,7 +200,7 @@ fn copySquashFromBlockDev(
         while (done < ext.size) {
             const remain = ext.size - done;
             const chunk: usize = @min(buf.len, @as(usize, @intCast(remain)));
-            const rd = std.posix.pread(in_fd, buf[0..chunk], ext.start_byte + done) catch {
+            const rd = sys.pread(in_fd, buf[0..chunk], ext.start_byte + done) catch {
                 if (klog_arg) |k| k.emerg("dynamod live: pread squash extent failed", .{});
                 halt();
             };
@@ -268,7 +267,7 @@ fn mountIso(dev_path: []const u8, klog_arg: ?kmsg) void {
         constants.MS_RDONLY,
         0,
     );
-    if (linux.E.init(r1) == .SUCCESS) {
+    if (linux.errno(r1) == .SUCCESS) {
         if (klog_arg) |k| k.info("dynamod live: mounted iso9660 on {s}", .{iso_mp});
         // Do not sync(2) here: on QEMU + ATAPI CD-ROM it can block indefinitely after
         // mounting the ISO, before we copy squashfs or attach the loop device.
@@ -282,7 +281,7 @@ fn mountIso(dev_path: []const u8, klog_arg: ?kmsg) void {
         constants.MS_RDONLY,
         0,
     );
-    if (linux.E.init(r2) == .SUCCESS) {
+    if (linux.errno(r2) == .SUCCESS) {
         if (klog_arg) |k| k.info("dynamod live: mounted udf on {s}", .{iso_mp});
         return;
     }
@@ -296,7 +295,7 @@ fn attachLoopAndMountSquash(squash_path_z: [*:0]const u8, klog_arg: ?kmsg) void 
 
     const ctl_path: [*:0]const u8 = "/dev/loop-control";
     const ctl_fd = linux.open(ctl_path, .{ .ACCMODE = .RDWR }, 0);
-    if (linux.E.init(ctl_fd) != .SUCCESS) {
+    if (linux.errno(ctl_fd) != .SUCCESS) {
         if (klog_arg) |k| k.emerg("dynamod live: cannot open /dev/loop-control", .{});
         halt();
     }
@@ -318,14 +317,14 @@ fn attachLoopAndMountSquash(squash_path_z: [*:0]const u8, klog_arg: ?kmsg) void 
     loop_path[lp.len] = 0;
 
     const loop_fd = linux.open(@ptrCast(&loop_path), .{ .ACCMODE = .RDWR }, 0);
-    if (linux.E.init(loop_fd) != .SUCCESS) {
+    if (linux.errno(loop_fd) != .SUCCESS) {
         if (klog_arg) |k| k.emerg("dynamod live: cannot open loop device", .{});
         halt();
     }
     defer _ = linux.close(@intCast(loop_fd));
 
     const squash_fd = linux.open(squash_path_z, .{ .ACCMODE = .RDONLY }, 0);
-    if (linux.E.init(squash_fd) != .SUCCESS) {
+    if (linux.errno(squash_fd) != .SUCCESS) {
         if (klog_arg) |k| k.emerg("dynamod live: cannot open squashfs image", .{});
         halt();
     }
@@ -351,7 +350,7 @@ fn attachLoopAndMountSquash(squash_path_z: [*:0]const u8, klog_arg: ?kmsg) void 
         constants.MS_RDONLY,
         0,
     );
-    if (linux.E.init(mrc) != .SUCCESS) {
+    if (linux.errno(mrc) != .SUCCESS) {
         if (klog_arg) |k| k.emerg("dynamod live: mount squashfs failed", .{});
         halt();
     }
@@ -384,7 +383,7 @@ fn mountOverlayNewroot(klog_arg: ?kmsg) void {
         0,
         @intFromPtr(@as([*:0]const u8, @ptrCast(&opt))),
     );
-    if (linux.E.init(mrc) != .SUCCESS) {
+    if (linux.errno(mrc) != .SUCCESS) {
         if (klog_arg) |k| k.emerg("dynamod live: mount overlay on /newroot failed", .{});
         halt();
     }
@@ -423,7 +422,8 @@ pub fn doLiveSwitchRoot(cl: *const cmdline.Cmdline, klog_arg: ?kmsg) noreturn {
     mkdir_path("/run/dynamod");
     mkdir_path("/run/dynamod/live");
     mkdir_path("/run/dynamod/live/iso");
-    mkdir_path("/run/dynamod/live/squash");
+    mkdir_path("/run/live");
+    mkdir_path(constants.live_squash_mp);
     mkdir_path("/run/dynamod/live/upper");
     mkdir_path("/run/dynamod/live/work");
 
@@ -481,7 +481,7 @@ pub fn doLiveSwitchRoot(cl: *const cmdline.Cmdline, klog_arg: ?kmsg) noreturn {
             MS_BIND,
             0,
         );
-        if (linux.E.init(brc) != .SUCCESS) {
+        if (linux.errno(brc) != .SUCCESS) {
             if (klog_arg) |k| k.emerg("dynamod live: bind mount squash to /newroot failed", .{});
             halt();
         }

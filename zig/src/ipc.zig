@@ -7,6 +7,7 @@ const constants = @import("constants.zig");
 const msgpack = @import("msgpack.zig");
 const kmsg = @import("kmsg.zig");
 const shutdown_mod = @import("shutdown.zig");
+const sys = @import("sys.zig");
 
 pub const ShutdownKind = shutdown_mod.ShutdownKind;
 
@@ -32,14 +33,14 @@ pub const ReadBuffer = struct {
 
     /// Read available data from the fd into the buffer.
     /// Returns error.EndOfStream on EOF, error.WouldBlock if nothing available.
-    pub fn readFrom(self: *ReadBuffer, fd: std.posix.fd_t) !void {
+    pub fn readFrom(self: *ReadBuffer, fd: linux.fd_t) (sys.ReadError || error{EndOfStream})!void {
         const space = self.buf[self.len..];
         if (space.len == 0) {
             self.len = 0;
             return;
         }
 
-        const n = std.posix.read(fd, space) catch |e| {
+        const n = sys.read(fd, space) catch |e| {
             if (e == error.WouldBlock) return;
             return e;
         };
@@ -162,7 +163,7 @@ fn parseLogToKmsg(raw: []const u8) InitMessage {
 
 /// Encode and send a simple message (heartbeat ack, shutdown signal, etc.)
 /// Uses a fixed buffer — no allocation.
-pub fn sendHeartbeatAck(fd: std.posix.fd_t, msg_id: u64) void {
+pub fn sendHeartbeatAck(fd: linux.fd_t, msg_id: u64) void {
     var buf: [256]u8 = undefined;
     var offset: usize = HEADER_SIZE; // Leave room for header
 
@@ -187,11 +188,11 @@ pub fn sendHeartbeatAck(fd: std.posix.fd_t, msg_id: u64) void {
     buf[1] = constants.ipc_magic[1];
     std.mem.writeInt(u32, buf[2..6], @intCast(payload_len), .little);
 
-    _ = std.posix.write(fd, buf[0..offset]) catch {};
+    _ = sys.write(fd, buf[0..offset]) catch {};
 }
 
 /// Send a shutdown signal notification to svmgr.
-pub fn sendShutdownSignal(fd: std.posix.fd_t, sig_name: []const u8) void {
+pub fn sendShutdownSignal(fd: linux.fd_t, sig_name: []const u8) void {
     var buf: [256]u8 = undefined;
     var offset: usize = HEADER_SIZE;
 
@@ -213,5 +214,5 @@ pub fn sendShutdownSignal(fd: std.posix.fd_t, sig_name: []const u8) void {
     buf[1] = constants.ipc_magic[1];
     std.mem.writeInt(u32, buf[2..6], @intCast(payload_len), .little);
 
-    _ = std.posix.write(fd, buf[0..offset]) catch {};
+    _ = sys.write(fd, buf[0..offset]) catch {};
 }

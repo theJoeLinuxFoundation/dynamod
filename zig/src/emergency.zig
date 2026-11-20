@@ -10,6 +10,7 @@ const std = @import("std");
 const linux = std.os.linux;
 const constants = @import("constants.zig");
 const kmsg = @import("kmsg.zig");
+const sys = @import("sys.zig");
 
 /// Run an emergency shell. Blocks until the shell exits.
 /// Returns true if a shell was spawned and reaped, false otherwise.
@@ -17,9 +18,9 @@ pub fn runShell(klog: ?kmsg) bool {
     if (klog) |k| k.emerg("=== entering emergency shell on /dev/console ===", .{});
 
     const fork_rc = linux.fork();
-    const fork_err = linux.E.init(fork_rc);
+    const fork_err = linux.errno(fork_rc);
     if (fork_err != .SUCCESS) {
-        if (klog) |k| k.err("emergency: fork failed (errno {d})", .{@intFromEnum(fork_err)});
+        if (klog) |k| k.err("emergency: fork failed (errno {d})", .{@backingInt(fork_err)});
         return false;
     }
 
@@ -38,14 +39,14 @@ pub fn runShell(klog: ?kmsg) bool {
         // kernel installs this as our controlling tty (we are a fresh session
         // leader with no controlling tty after setsid).
         const con_fd_rc = linux.open(constants.console_path, .{ .ACCMODE = .RDWR }, 0);
-        if (linux.E.init(con_fd_rc) != .SUCCESS) {
-            _ = std.posix.write(2, "dynamod-init: emergency: cannot open /dev/console\n") catch {};
+        if (linux.errno(con_fd_rc) != .SUCCESS) {
+            _ = sys.write(2, "dynamod-init: emergency: cannot open /dev/console\n") catch {};
             linux.exit(127);
         }
         const con_fd: i32 = @intCast(con_fd_rc);
-        _ = linux.dup2(@intCast(con_fd), 0);
-        _ = linux.dup2(@intCast(con_fd), 1);
-        _ = linux.dup2(@intCast(con_fd), 2);
+        sys.dup2(con_fd, 0);
+        sys.dup2(con_fd, 1);
+        sys.dup2(con_fd, 2);
         if (con_fd > 2) _ = linux.close(con_fd);
 
         execShell();
@@ -57,16 +58,17 @@ pub fn runShell(klog: ?kmsg) bool {
     // Block-wait for the shell to exit. We may also reap unrelated orphans
     // along the way (init is PID 1 — anything could become our child).
     while (true) {
-        var status: u32 = 0;
-        const rc = linux.waitpid(-1, &status, 0);
-        const e = linux.E.init(rc);
+        var raw_status: i32 = 0;
+        const rc = linux.waitpid(-1, &raw_status, 0);
+        const e = linux.errno(rc);
+        const status: u32 = @bitCast(raw_status);
         if (e == .INTR) continue;
         if (e == .CHILD) {
             if (klog) |k| k.warn("emergency: waitpid returned ECHILD before shell exit", .{});
             return false;
         }
         if (e != .SUCCESS) {
-            if (klog) |k| k.err("emergency: waitpid failed (errno {d})", .{@intFromEnum(e)});
+            if (klog) |k| k.err("emergency: waitpid failed (errno {d})", .{@backingInt(e)});
             return false;
         }
         const reaped: linux.pid_t = @intCast(rc);
@@ -102,6 +104,6 @@ fn execShell() noreturn {
         const argv = [_:null]?[*:0]const u8{ "sulogin", null };
         _ = linux.execve("/sbin/sulogin", &argv, &env);
     }
-    _ = std.posix.write(2, "dynamod-init: emergency: no shell found (tried /bin/sh, /bin/busybox, /sbin/sulogin)\n") catch {};
+    _ = sys.write(2, "dynamod-init: emergency: no shell found (tried /bin/sh, /bin/busybox, /sbin/sulogin)\n") catch {};
     linux.exit(127);
 }

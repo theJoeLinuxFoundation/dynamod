@@ -11,6 +11,7 @@
 /// to mounting the ISO; this module never halts.
 const std = @import("std");
 const kmsg = @import("kmsg.zig");
+const sys = @import("sys.zig");
 
 /// ECMA-119 logical sector: volume descriptors are addressed in 2048-byte sectors
 /// and directory records never cross a 2048-byte sector boundary, regardless of
@@ -42,17 +43,17 @@ pub const FileExtents = struct {
 /// `dev_z` using only pread. Returns null on anything missing/unsupported (reason
 /// logged) so the caller can fall back to mounting the ISO.
 pub fn locateFile(dev_z: [*:0]const u8, path: []const u8, klog_arg: ?kmsg) ?FileExtents {
-    const fd = std.posix.openZ(dev_z, .{ .ACCMODE = .RDONLY, .NOCTTY = true }, 0) catch {
+    const fd = sys.openZ(dev_z, .{ .ACCMODE = .RDONLY, .NOCTTY = true }, 0) catch {
         if (klog_arg) |k| k.warn("live: iso9660: cannot open device for parse", .{});
         return null;
     };
-    defer std.posix.close(fd);
+    defer sys.close(fd);
     return locateFileInSource(.{ .fd = fd }, path, klog_arg);
 }
 
 /// Byte source: a device fd in production, a memory image in tests.
 const Source = union(enum) {
-    fd: std.posix.fd_t,
+    fd: sys.fd_t,
     mem: []const u8,
 };
 
@@ -61,7 +62,7 @@ fn readFull(src: Source, off: u64, buf: []u8) bool {
         .fd => |fd| {
             var done: usize = 0;
             while (done < buf.len) {
-                const n = std.posix.pread(fd, buf[done..], off + done) catch return false;
+                const n = sys.pread(fd, buf[done..], off + done) catch return false;
                 if (n == 0) return false;
                 done += n;
             }
@@ -664,7 +665,7 @@ test "rrName single and continued NM" {
     }
 
     // CE present without any inline NM: the name may live in the continuation area
-    const ce = [_]u8{ 'C', 'E', 28, 1 } ++ [_]u8{0} ** 24;
+    const ce = [_]u8{ 'C', 'E', 28, 1 } ++ @as([24]u8, @splat(0));
     switch (rrName(&ce, 0, &out)) {
         .incomplete => {},
         else => return error.TestUnexpectedResult,

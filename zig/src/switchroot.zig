@@ -9,6 +9,7 @@ const constants = @import("constants.zig");
 const kmsg = @import("kmsg.zig");
 const cmdline = @import("cmdline.zig");
 const rootdev = @import("rootdev.zig");
+const sys = @import("sys.zig");
 
 /// Perform the full initramfs -> rootfs transition. Does not return.
 ///
@@ -112,9 +113,9 @@ fn mountRootDevice(
         parsed.flags,
         data_ptr,
     );
-    const e = linux.E.init(rc);
+    const e = linux.errno(rc);
     if (e != .SUCCESS) {
-        if (klog_arg) |k| k.err("mount failed: errno {d}", .{@intFromEnum(e)});
+        if (klog_arg) |k| k.err("mount failed: errno {d}", .{@backingInt(e)});
         return error.MountFailed;
     }
 }
@@ -190,6 +191,9 @@ fn moveMounts(klog_arg: ?kmsg) void {
         .{ .from = "/proc", .to = "/newroot/proc" },
         .{ .from = "/sys", .to = "/newroot/sys" },
         .{ .from = "/dev", .to = "/newroot/dev" },
+        // What the initramfs left under /run (the live image and its copy in
+        // memory, in live mode) stays reachable, as systemd's initrd does it.
+        .{ .from = "/run", .to = "/newroot/run" },
     };
 
     for (&moves) |m| {
@@ -197,11 +201,11 @@ fn moveMounts(klog_arg: ?kmsg) void {
         _ = linux.mkdirat(@bitCast(@as(i32, linux.AT.FDCWD)), m.to, 0o755);
 
         const rc = linux.mount(m.from, m.to, @ptrFromInt(0), constants.MS_MOVE, 0);
-        const e = linux.E.init(rc);
+        const e = linux.errno(rc);
         if (e != .SUCCESS) {
             if (klog_arg) |k| {
                 const from_span = std.mem.span(m.from);
-                k.warn("failed to move {s}: errno {d}", .{ from_span, @intFromEnum(e) });
+                k.warn("failed to move {s}: errno {d}", .{ from_span, @backingInt(e) });
             }
         } else {
             if (klog_arg) |k| {
@@ -218,30 +222,41 @@ fn moveMounts(klog_arg: ?kmsg) void {
 fn deleteInitramfsContents() void {
     // Open the root directory
     const root_fd = linux.open("/", .{ .ACCMODE = .RDONLY, .DIRECTORY = true }, 0);
-    const e = linux.E.init(root_fd);
+    const e = linux.errno(root_fd);
     if (e != .SUCCESS) return;
 
     // Get the device ID of rootfs for mount point detection
-    var root_stat: linux.Stat = undefined;
-    const stat_rc = linux.fstat(@intCast(root_fd), &root_stat);
-    if (linux.E.init(stat_rc) != .SUCCESS) {
+    const root_dev = statDev(@intCast(root_fd), "", linux.AT.EMPTY_PATH) orelse {
         _ = linux.close(@intCast(root_fd));
         return;
-    }
+    };
 
-    recursiveDelete(@intCast(root_fd), root_stat.dev, 0);
+    recursiveDelete(@intCast(root_fd), root_dev, 0);
     _ = linux.close(@intCast(root_fd));
 }
 
+/// Device (st_dev) a file resides on, as a major/minor pair.
+const DevId = struct { major: u32, minor: u32 };
+
+/// statx(2) replacement for the fstat/fstatat calls Zig 0.15 offered: Zig 0.17.1
+/// std.os.linux has no `Stat`/`fstat`/`fstatat` (the kernel `struct stat`
+/// layout differs per arch), while `struct statx` is arch-independent.
+fn statDev(dir_fd: linux.fd_t, path: [*:0]const u8, flags: u32) ?DevId {
+    var stx: linux.Statx = undefined;
+    const rc = linux.statx(dir_fd, path, flags, linux.STATX.BASIC_STATS, &stx);
+    if (linux.errno(rc) != .SUCCESS) return null;
+    return .{ .major = stx.dev_major, .minor = stx.dev_minor };
+}
+
 /// Recursively delete directory contents, skipping mount points.
-fn recursiveDelete(dir_fd: std.posix.fd_t, root_dev: u64, depth: u32) void {
+fn recursiveDelete(dir_fd: linux.fd_t, root_dev: DevId, depth: u32) void {
     if (depth > 16) return; // prevent stack overflow
 
     var buf: [4096]u8 = undefined;
 
     while (true) {
         const nread = linux.getdents64(dir_fd, &buf, buf.len);
-        const nread_e = linux.E.init(nread);
+        const nread_e = linux.errno(nread);
         if (nread_e != .SUCCESS or nread == 0) break;
 
         var offset: usize = 0;
@@ -259,16 +274,9 @@ fn recursiveDelete(dir_fd: std.posix.fd_t, root_dev: u64, depth: u32) void {
             if (depth == 0 and std.mem.eql(u8, name, "newroot")) continue;
 
             // Check if this is a mount point (different device)
-            var child_stat: linux.Stat = undefined;
-            const sr = linux.fstatat(
-                dir_fd,
-                name_ptr,
-                &child_stat,
-                linux.AT.SYMLINK_NOFOLLOW,
-            );
-            if (linux.E.init(sr) != .SUCCESS) continue;
+            const child_dev = statDev(dir_fd, name_ptr, linux.AT.SYMLINK_NOFOLLOW) orelse continue;
 
-            if (child_stat.dev != root_dev) continue; // mount point, skip
+            if (child_dev.major != root_dev.major or child_dev.minor != root_dev.minor) continue; // mount point, skip
 
             if (entry.type == linux.DT.DIR) {
                 // Recurse into directory
@@ -278,7 +286,7 @@ fn recursiveDelete(dir_fd: std.posix.fd_t, root_dev: u64, depth: u32) void {
                     .{ .ACCMODE = .RDONLY, .DIRECTORY = true },
                     0,
                 );
-                if (linux.E.init(child_fd) == .SUCCESS) {
+                if (linux.errno(child_fd) == .SUCCESS) {
                     recursiveDelete(@intCast(child_fd), root_dev, depth + 1);
                     _ = linux.close(@intCast(child_fd));
                 }
@@ -296,9 +304,9 @@ fn recursiveDelete(dir_fd: std.posix.fd_t, root_dev: u64, depth: u32) void {
 fn execSwitchRoot(klog_arg: ?kmsg) noreturn {
     // chdir("/newroot")
     var chdir_rc = linux.chdir(constants.newroot_path);
-    var e = linux.E.init(chdir_rc);
+    var e = linux.errno(chdir_rc);
     if (e != .SUCCESS) {
-        if (klog_arg) |k| k.emerg("chdir /newroot failed: errno {d}", .{@intFromEnum(e)});
+        if (klog_arg) |k| k.emerg("chdir /newroot failed: errno {d}", .{@backingInt(e)});
         halt();
     }
 
@@ -306,25 +314,25 @@ fn execSwitchRoot(klog_arg: ?kmsg) noreturn {
     const dot: [*:0]const u8 = ".";
     const slash: [*:0]const u8 = "/";
     const mv_rc = linux.mount(dot, slash, @ptrFromInt(0), constants.MS_MOVE, 0);
-    e = linux.E.init(mv_rc);
+    e = linux.errno(mv_rc);
     if (e != .SUCCESS) {
-        if (klog_arg) |k| k.emerg("mount MS_MOVE failed: errno {d}", .{@intFromEnum(e)});
+        if (klog_arg) |k| k.emerg("mount MS_MOVE failed: errno {d}", .{@backingInt(e)});
         halt();
     }
 
     // chroot(".")
-    const chroot_rc = linux.syscall1(.chroot, @intFromPtr(dot));
-    e = linux.E.init(chroot_rc);
+    const chroot_rc = linux.chroot(dot);
+    e = linux.errno(chroot_rc);
     if (e != .SUCCESS) {
-        if (klog_arg) |k| k.emerg("chroot failed: errno {d}", .{@intFromEnum(e)});
+        if (klog_arg) |k| k.emerg("chroot failed: errno {d}", .{@backingInt(e)});
         halt();
     }
 
     // chdir("/") — reset cwd to new root
     chdir_rc = linux.chdir(slash);
-    e = linux.E.init(chdir_rc);
+    e = linux.errno(chdir_rc);
     if (e != .SUCCESS) {
-        if (klog_arg) |k| k.emerg("chdir / failed: errno {d}", .{@intFromEnum(e)});
+        if (klog_arg) |k| k.emerg("chdir / failed: errno {d}", .{@backingInt(e)});
         halt();
     }
 
@@ -348,7 +356,7 @@ fn forkExecWait(
     klog_arg: ?kmsg,
 ) bool {
     const pid_rc = linux.fork();
-    const pid_e = linux.E.init(pid_rc);
+    const pid_e = linux.errno(pid_rc);
     if (pid_e != .SUCCESS) {
         if (klog_arg) |k| k.warn("fork failed for {s}", .{std.mem.span(path)});
         return false;
@@ -360,27 +368,23 @@ fn forkExecWait(
         linux.exit(1);
     }
 
-    var status: u32 = 0;
+    var status: i32 = 0;
     _ = linux.wait4(@intCast(pid_rc), &status, 0, null);
-    return (status & 0xff00) == 0;
+    return (@as(u32, @bitCast(status)) & 0xff00) == 0;
 }
 
 fn binaryExists(path: []const u8) bool {
-    _ = std.fs.openFileAbsolute(path, .{}) catch return false;
-    return true;
+    return sys.fileExists(path);
 }
 
 /// Load common block-device and filesystem kernel modules so that disk
 /// devices appear in /dev before root resolution.  Best-effort: silently
 /// skips modules that don't exist or fail to load.
 fn loadDiskModules(klog_arg: ?kmsg) void {
-    {
-        var d = std.fs.openDirAbsolute("/lib/modules", .{}) catch return;
-        d.close();
-    }
+    if (!sys.dirExists("/lib/modules")) return;
 
     const modprobe_path: [*:0]const u8 = "/bin/modprobe";
-    _ = std.fs.openFileAbsolute(std.mem.span(modprobe_path), .{}) catch return;
+    if (!sys.fileExists(std.mem.span(modprobe_path))) return;
 
     if (klog_arg) |k| k.info("loading disk/storage modules (best-effort)", .{});
 
@@ -433,6 +437,21 @@ pub fn runColdplug(klog_arg: ?kmsg) void {
     }
 
     if (klog_arg) |k| k.info("no device manager found (udevadm, mdev), skipping coldplug", .{});
+}
+
+// --- Tests ---
+
+test "statDev: same device for the same fs, different across a mount point" {
+    const root_rc = linux.open("/", .{ .ACCMODE = .RDONLY, .DIRECTORY = true }, 0);
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(root_rc));
+    const root_fd: linux.fd_t = @intCast(root_rc);
+    defer _ = linux.close(root_fd);
+
+    const root = statDev(root_fd, "", linux.AT.EMPTY_PATH) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(root, statDev(linux.AT.FDCWD, "/", 0) orelse return error.TestUnexpectedResult);
+    // /proc is always a separate (procfs) mount.
+    const proc = statDev(root_fd, "proc", linux.AT.SYMLINK_NOFOLLOW) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(proc.major != root.major or proc.minor != root.minor);
 }
 
 /// Emergency halt — called when switch_root fails irrecoverably.

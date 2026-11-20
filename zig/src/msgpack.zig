@@ -104,21 +104,21 @@ pub fn decode(buf: []const u8) DecodeError!DecodeResult {
 
 fn decodeUint(buf: []const u8, comptime byte_count: comptime_int) DecodeError!DecodeResult {
     if (buf.len < 1 + byte_count) return DecodeError.UnexpectedEof;
-    const IntType = std.meta.Int(.unsigned, byte_count * 8);
+    const IntType = @Int(.unsigned, byte_count * 8);
     const val = std.mem.readInt(IntType, buf[1..][0..byte_count], .big);
     return .{ .value = .{ .uint = val }, .consumed = 1 + byte_count };
 }
 
 fn decodeInt(buf: []const u8, comptime byte_count: comptime_int) DecodeError!DecodeResult {
     if (buf.len < 1 + byte_count) return DecodeError.UnexpectedEof;
-    const IntType = std.meta.Int(.signed, byte_count * 8);
+    const IntType = @Int(.signed, byte_count * 8);
     const val = std.mem.readInt(IntType, buf[1..][0..byte_count], .big);
     return .{ .value = .{ .int = val }, .consumed = 1 + byte_count };
 }
 
 fn decodeStr(buf: []const u8, comptime len_bytes: comptime_int) DecodeError!DecodeResult {
     if (buf.len < 1 + len_bytes) return DecodeError.UnexpectedEof;
-    const LenType = std.meta.Int(.unsigned, len_bytes * 8);
+    const LenType = @Int(.unsigned, len_bytes * 8);
     const str_len: usize = std.mem.readInt(LenType, buf[1..][0..len_bytes], .big);
     const header = 1 + len_bytes;
     if (buf.len < header + str_len) return DecodeError.UnexpectedEof;

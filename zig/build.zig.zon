@@ -2,7 +2,7 @@
     .name = .dynamod_init,
     .version = "0.1.0",
     .fingerprint = 0xa9defb12511022df,
-    .minimum_zig_version = "0.15.2",
+    .minimum_zig_version = "0.17.1",
     .dependencies = .{},
     .paths = .{
         "build.zig",

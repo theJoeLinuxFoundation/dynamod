@@ -6,6 +6,7 @@ const std = @import("std");
 const linux = std.os.linux;
 const constants = @import("constants.zig");
 const kmsg = @import("kmsg.zig");
+const sys = @import("sys.zig");
 
 pub const ResolvedDevice = struct {
     /// Buffer holding the resolved device path.
@@ -105,8 +106,7 @@ fn resolveSymlink(dir: []const u8, value: []const u8, rootwait: bool, klog_arg: 
         const link_path = std.fmt.bufPrint(&link_path_buf, "{s}/{s}", .{ dir, value }) catch continue;
 
         // Check if the symlink path exists
-        const file = std.fs.openFileAbsolute(link_path, .{}) catch continue;
-        file.close();
+        if (!sys.fileExists(link_path)) continue;
 
         // The symlink exists — now readlink to get the actual device path
         // Use the absolute path approach: the symlinks are like ../../sda1
@@ -154,15 +154,14 @@ fn resolveUuidValue(value: []const u8, rootwait: bool, klog_arg: ?kmsg) ?Resolve
         {
             var link_path_buf: [512]u8 = undefined;
             const link_path = std.fmt.bufPrint(&link_path_buf, "{s}/{s}", .{ by_uuid_dir, value }) catch continue;
-            const file = std.fs.openFileAbsolute(link_path, .{}) catch {
+            if (!sys.fileExists(link_path)) {
                 // Symlink not found — try blkid fallback
                 if (tryBlkidUuidDevice(value, klog_arg)) |r| {
                     if (klog_arg) |k| k.info("resolved UUID={s} via blkid -> {s}", .{ value, r.path() });
                     return r;
                 }
                 continue;
-            };
-            file.close();
+            }
 
             var result = ResolvedDevice{};
             if (link_path.len > result.path_buf.len - 1) continue;
@@ -187,21 +186,21 @@ fn resolveUuidValue(value: []const u8, rootwait: bool, klog_arg: ?kmsg) ?Resolve
 /// and scanning the output for a line containing UUID="<value>".
 /// Output format: /dev/vda2: UUID="xxxx" TYPE="ext4" ...
 fn tryBlkidUuidDevice(uuid: []const u8, _: ?kmsg) ?ResolvedDevice {
-    _ = std.fs.openFileAbsolute(std.mem.span(blkid_path), .{}) catch return null;
+    const blkid_path = findBlkid() orelse return null;
 
     const pid_rc = linux.fork();
-    const pid_e = linux.E.init(pid_rc);
+    const pid_e = linux.errno(pid_rc);
     if (pid_e != .SUCCESS) return null;
 
     if (pid_rc == 0) {
         const out: [*:0]const u8 = "/run/dynamod-blkid-out";
         const out_fd = linux.open(out, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o644);
-        if (linux.E.init(out_fd) != .SUCCESS) linux.exit(127);
-        _ = linux.dup2(@intCast(out_fd), 1);
+        if (linux.errno(out_fd) != .SUCCESS) linux.exit(127);
+        sys.dup2(@intCast(out_fd), 1);
         _ = linux.close(@intCast(out_fd));
         const null_fd = linux.open("/dev/null", .{ .ACCMODE = .WRONLY }, 0);
-        if (linux.E.init(null_fd) == .SUCCESS) {
-            _ = linux.dup2(@intCast(null_fd), 2);
+        if (linux.errno(null_fd) == .SUCCESS) {
+            sys.dup2(@intCast(null_fd), 2);
             _ = linux.close(@intCast(null_fd));
         }
         const argv = [_:null]?[*:0]const u8{blkid_path};
@@ -210,13 +209,13 @@ fn tryBlkidUuidDevice(uuid: []const u8, _: ?kmsg) ?ResolvedDevice {
         linux.exit(127);
     }
 
-    var status: u32 = 0;
+    var status: i32 = 0;
     _ = linux.wait4(@intCast(pid_rc), &status, 0, null);
 
-    const file = std.fs.openFileAbsolute(blkid_out_path, .{}) catch return null;
-    defer file.close();
+    const file = sys.openFile(blkid_out_path, .read_only) catch return null;
+    defer sys.close(file);
     var read_buf: [4096]u8 = undefined;
-    const n = file.readAll(&read_buf) catch return null;
+    const n = sys.readAll(file, &read_buf) catch return null;
     if (n == 0) return null;
 
     // Build needle: UUID="<uuid>"
@@ -252,7 +251,18 @@ fn tryBlkidUuidDevice(uuid: []const u8, _: ?kmsg) ?ResolvedDevice {
 }
 
 const by_label_dir = "/dev/disk/by-label";
-const blkid_path: [*:0]const u8 = "/bin/blkid";
+/// Where blkid may be: BusyBox and most distributions have /bin or /sbin,
+/// util-linux installs it in /usr/sbin, and on a /usr-merged system whose
+/// /bin and /sbin are separate links into /usr (joe Linux) only the latter
+/// has it.
+const blkid_paths = [_][*:0]const u8{ "/bin/blkid", "/sbin/blkid", "/usr/bin/blkid", "/usr/sbin/blkid" };
+
+fn findBlkid() ?[*:0]const u8 {
+    for (blkid_paths) |p| {
+        if (sys.fileExists(std.mem.span(p))) return p;
+    }
+    return null;
+}
 const blkid_out_path = "/run/dynamod-blkid-out";
 
 /// LABEL=: udev-style symlinks first, then `blkid -L` (works for ISO volume id when by-label is missing).
@@ -301,8 +311,7 @@ fn resolveLabelValue(value: []const u8, rootwait: bool, klog_arg: ?kmsg) ?Resolv
 fn tryResolveLabelSymlinkExact(value: []const u8) ?ResolvedDevice {
     var link_path_buf: [512]u8 = undefined;
     const link_path = std.fmt.bufPrint(&link_path_buf, "{s}/{s}", .{ by_label_dir, value }) catch return null;
-    const f = std.fs.openFileAbsolute(link_path, .{}) catch return null;
-    defer f.close();
+    if (!sys.fileExists(link_path)) return null;
     var result = ResolvedDevice{};
     if (link_path.len > result.path_buf.len - 1) return null;
     @memcpy(result.path_buf[0..link_path.len], link_path);
@@ -312,23 +321,45 @@ fn tryResolveLabelSymlinkExact(value: []const u8) ?ResolvedDevice {
 }
 
 fn tryResolveLabelSymlinkScan(value: []const u8) ?ResolvedDevice {
-    var dir = std.fs.openDirAbsolute(by_label_dir, .{ .iterate = true }) catch return null;
-    defer dir.close();
-    var it = dir.iterate();
+    return scanDirIgnoreCase(by_label_dir, value);
+}
+
+/// First entry of `dir` whose name equals `value` ignoring ASCII case and that
+/// opens as a file, as "dir/name".
+fn scanDirIgnoreCase(dir: []const u8, value: []const u8) ?ResolvedDevice {
+    const dir_fd = sys.openDirIterable(dir) catch return null;
+    defer sys.close(dir_fd);
+    // Raw getdents64, as std.fs.Dir.Iterator did on Linux in Zig 0.15
+    // (same 1 KiB buffer, "." and ".." skipped).
+    var dents: [1024]u8 align(@alignOf(linux.dirent64)) = undefined;
     while (true) {
-        const entry_opt = it.next() catch return null;
-        const entry = entry_opt orelse break;
-        if (!std.ascii.eqlIgnoreCase(entry.name, value)) continue;
-        var link_path_buf: [512]u8 = undefined;
-        const link_path = std.fmt.bufPrint(&link_path_buf, "{s}/{s}", .{ by_label_dir, entry.name }) catch continue;
-        const f = std.fs.openFileAbsolute(link_path, .{}) catch continue;
-        f.close();
-        var result = ResolvedDevice{};
-        if (link_path.len > result.path_buf.len - 1) continue;
-        @memcpy(result.path_buf[0..link_path.len], link_path);
-        result.path_buf[link_path.len] = 0;
-        result.path_len = link_path.len;
-        return result;
+        const nread = linux.getdents64(dir_fd, &dents, dents.len);
+        if (linux.errno(nread) != .SUCCESS) return null;
+        if (nread == 0) break;
+
+        var off: usize = 0;
+        while (off < nread) {
+            // Bounds-check the record before trusting it (never happens with a sane kernel).
+            const name_start = off + @offsetOf(linux.dirent64, "name");
+            if (name_start > nread) return null;
+            const entry: *align(1) const linux.dirent64 = @ptrCast(&dents[off]);
+            const rec_end = off + entry.reclen;
+            if (rec_end <= name_start or rec_end > nread) return null;
+            off = rec_end;
+
+            const name = std.mem.sliceTo(dents[name_start..rec_end], 0);
+            if (std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) continue;
+            if (!std.ascii.eqlIgnoreCase(name, value)) continue;
+            var link_path_buf: [512]u8 = undefined;
+            const link_path = std.fmt.bufPrint(&link_path_buf, "{s}/{s}", .{ dir, name }) catch continue;
+            if (!sys.fileExists(link_path)) continue;
+            var result = ResolvedDevice{};
+            if (link_path.len > result.path_buf.len - 1) continue;
+            @memcpy(result.path_buf[0..link_path.len], link_path);
+            result.path_buf[link_path.len] = 0;
+            result.path_len = link_path.len;
+            return result;
+        }
     }
     return null;
 }
@@ -347,21 +378,21 @@ fn parseBlkidDeviceLine(raw: []const u8) ?[]const u8 {
 /// and scan the output for LABEL="<value>" (case-insensitive — ISO labels are
 /// conventionally upper case).
 fn tryBlkidScanLabelDevice(label: []const u8, _: ?kmsg) ?ResolvedDevice {
-    _ = std.fs.openFileAbsolute(std.mem.span(blkid_path), .{}) catch return null;
+    const blkid_path = findBlkid() orelse return null;
 
     const pid_rc = linux.fork();
-    const pid_e = linux.E.init(pid_rc);
+    const pid_e = linux.errno(pid_rc);
     if (pid_e != .SUCCESS) return null;
 
     if (pid_rc == 0) {
         const out: [*:0]const u8 = "/run/dynamod-blkid-out";
         const out_fd = linux.open(out, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o644);
-        if (linux.E.init(out_fd) != .SUCCESS) linux.exit(127);
-        _ = linux.dup2(@intCast(out_fd), 1);
+        if (linux.errno(out_fd) != .SUCCESS) linux.exit(127);
+        sys.dup2(@intCast(out_fd), 1);
         _ = linux.close(@intCast(out_fd));
         const null_fd = linux.open("/dev/null", .{ .ACCMODE = .WRONLY }, 0);
-        if (linux.E.init(null_fd) == .SUCCESS) {
-            _ = linux.dup2(@intCast(null_fd), 2);
+        if (linux.errno(null_fd) == .SUCCESS) {
+            sys.dup2(@intCast(null_fd), 2);
             _ = linux.close(@intCast(null_fd));
         }
         const argv = [_:null]?[*:0]const u8{blkid_path};
@@ -370,13 +401,13 @@ fn tryBlkidScanLabelDevice(label: []const u8, _: ?kmsg) ?ResolvedDevice {
         linux.exit(127);
     }
 
-    var status: u32 = 0;
+    var status: i32 = 0;
     _ = linux.wait4(@intCast(pid_rc), &status, 0, null);
 
-    const file = std.fs.openFileAbsolute(blkid_out_path, .{}) catch return null;
-    defer file.close();
+    const file = sys.openFile(blkid_out_path, .read_only) catch return null;
+    defer sys.close(file);
     var read_buf: [4096]u8 = undefined;
-    const n = file.readAll(&read_buf) catch return null;
+    const n = sys.readAll(file, &read_buf) catch return null;
     if (n == 0) return null;
 
     var needle_buf: [300]u8 = undefined;
@@ -388,7 +419,7 @@ fn tryBlkidScanLabelDevice(label: []const u8, _: ?kmsg) ?ResolvedDevice {
         while (end < n and read_buf[end] != '\n') : (end += 1) {}
         const line = read_buf[pos..end];
 
-        if (std.ascii.indexOfIgnoreCase(line, needle) != null) {
+        if (std.ascii.findIgnoreCase(line, needle) != null) {
             if (std.mem.indexOfScalar(u8, line, ':')) |colon| {
                 const dp = std.mem.trim(u8, line[0..colon], " \t");
                 if (dp.len >= 5 and std.mem.startsWith(u8, dp, "/dev/") and deviceExists(dp)) {
@@ -409,7 +440,7 @@ fn tryBlkidScanLabelDevice(label: []const u8, _: ?kmsg) ?ResolvedDevice {
 }
 
 fn tryBlkidLabelDevice(label: []const u8, _: ?kmsg) ?ResolvedDevice {
-    _ = std.fs.openFileAbsolute(std.mem.span(blkid_path), .{}) catch return null;
+    const blkid_path = findBlkid() orelse return null;
 
     var label_z: [256:0]u8 = undefined;
     if (label.len >= label_z.len - 1) return null;
@@ -417,18 +448,18 @@ fn tryBlkidLabelDevice(label: []const u8, _: ?kmsg) ?ResolvedDevice {
     label_z[label.len] = 0;
 
     const pid_rc = linux.fork();
-    const pid_e = linux.E.init(pid_rc);
+    const pid_e = linux.errno(pid_rc);
     if (pid_e != .SUCCESS) return null;
 
     if (pid_rc == 0) {
         const out: [*:0]const u8 = "/run/dynamod-blkid-out";
         const out_fd = linux.open(out, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o644);
-        if (linux.E.init(out_fd) != .SUCCESS) linux.exit(127);
-        _ = linux.dup2(@intCast(out_fd), 1);
+        if (linux.errno(out_fd) != .SUCCESS) linux.exit(127);
+        sys.dup2(@intCast(out_fd), 1);
         _ = linux.close(@intCast(out_fd));
         const null_fd = linux.open("/dev/null", .{ .ACCMODE = .WRONLY }, 0);
-        if (linux.E.init(null_fd) == .SUCCESS) {
-            _ = linux.dup2(@intCast(null_fd), 2);
+        if (linux.errno(null_fd) == .SUCCESS) {
+            sys.dup2(@intCast(null_fd), 2);
             _ = linux.close(@intCast(null_fd));
         }
         const arg_l: [*:0]const u8 = "-L";
@@ -438,16 +469,17 @@ fn tryBlkidLabelDevice(label: []const u8, _: ?kmsg) ?ResolvedDevice {
         linux.exit(127);
     }
 
-    var status: u32 = 0;
-    _ = linux.wait4(@intCast(pid_rc), &status, 0, null);
+    var raw_status: i32 = 0;
+    _ = linux.wait4(@intCast(pid_rc), &raw_status, 0, null);
+    const status: u32 = @bitCast(raw_status);
     // Normal exit: low byte 0; exit code in bits 8–15 (Linux wait status).
     if ((status & 0xff) != 0) return null;
     if (((status >> 8) & 0xff) != 0) return null;
 
-    const file = std.fs.openFileAbsolute(blkid_out_path, .{}) catch return null;
-    defer file.close();
+    const file = sys.openFile(blkid_out_path, .read_only) catch return null;
+    defer sys.close(file);
     var read_buf: [300]u8 = undefined;
-    const n = file.readAll(&read_buf) catch return null;
+    const n = sys.readAll(file, &read_buf) catch return null;
     const dev_path = parseBlkidDeviceLine(read_buf[0..n]) orelse return null;
     if (!deviceExists(dev_path)) return null;
 
@@ -476,13 +508,11 @@ fn waitForDevice(result: ResolvedDevice, klog_arg: ?kmsg) ?ResolvedDevice {
 }
 
 /// Check if a device path exists by attempting to open it.
-/// Non-absolute paths (malformed root=) are treated as missing —
-/// openFileAbsolute would assert (and crash PID 1) on them.
+/// Non-absolute paths (malformed root=) are treated as missing rather than
+/// being resolved against the current directory.
 fn deviceExists(path: []const u8) bool {
     if (!std.fs.path.isAbsolute(path)) return false;
-    const file = std.fs.openFileAbsolute(path, .{}) catch return false;
-    file.close();
-    return true;
+    return sys.fileExists(path);
 }
 
 // --- Tests ---
@@ -496,4 +526,14 @@ test "direct path resolution" {
 test "unknown format treated as path" {
     const result = resolve("nonexistent", false, null);
     try std.testing.expect(result == null);
+}
+
+test "case-insensitive directory scan (getdents64)" {
+    // /dev spans several 1 KiB getdents64 batches on any real system.
+    const r = scanDirIgnoreCase("/dev", "NULL") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("/dev/null", r.path());
+    try std.testing.expect(scanDirIgnoreCase("/dev", "no-such-entry-dynamod") == null);
+    try std.testing.expect(scanDirIgnoreCase("/nonexistent-dynamod", "null") == null);
+    // "." and ".." are skipped.
+    try std.testing.expect(scanDirIgnoreCase("/dev", ".") == null);
 }

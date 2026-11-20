@@ -3,24 +3,26 @@
 /// being available during early boot or late shutdown.
 const std = @import("std");
 const linux = std.os.linux;
+const sys = @import("sys.zig");
 
 const Self = @This();
 
-fd: std.posix.fd_t,
+fd: linux.fd_t,
 
 /// Open /dev/kmsg for writing. Returns null if it cannot be opened
 /// (e.g. /dev is not yet mounted).
 pub fn init() ?Self {
     // Blocking writes: with O_NONBLOCK, a busy kmsg ring buffer returns EAGAIN and we would drop
     // lines silently (write ... catch {}), which looked like "zig never reached" the next step.
-    const fd = std.posix.open("/dev/kmsg", .{ .ACCMODE = .WRONLY, .NOCTTY = true }, 0) catch return null;
+    // Same flags std.posix.open got in Zig 0.15 (notably no O_CLOEXEC).
+    const fd = sys.openZ("/dev/kmsg", .{ .ACCMODE = .WRONLY, .NOCTTY = true }, 0) catch return null;
     return Self{ .fd = fd };
 }
 
-fn writeAllKmsg(fd: std.posix.fd_t, buf: []const u8) void {
+fn writeAllKmsg(fd: linux.fd_t, buf: []const u8) void {
     var off: usize = 0;
     while (off < buf.len) {
-        const n = std.posix.write(fd, buf[off..]) catch return;
+        const n = sys.write(fd, buf[off..]) catch return;
         if (n == 0) return;
         off += n;
     }

@@ -37,11 +37,18 @@ test {
     _ = @import("iso9660.zig");
     _ = @import("msgpack.zig");
     _ = @import("rootdev.zig");
+    _ = @import("boot.zig");
+    _ = @import("switchroot.zig");
+    _ = @import("sys.zig");
 }
 
-pub fn main() noreturn {
+/// `std.process.Init.Minimal` (argv + environ only) rather than the full
+/// `std.process.Init`: the latter makes start-up code create a heap allocator,
+/// an arena, a std.Io.Threaded instance and an environment map, none of which
+/// PID 1 uses (all I/O goes through std.os.linux, see sys.zig).
+pub fn main(init: std.process.Init.Minimal) noreturn {
     // Helper mode: create /etc/machine-id after root is remounted rw (see machine-id.toml).
-    var arg_it = std.process.args();
+    var arg_it = init.args.iterate();
     _ = arg_it.skip();
     if (arg_it.next()) |arg| {
         if (std.mem.eql(u8, arg, "--write-machine-id")) {
@@ -51,7 +58,7 @@ pub fn main() noreturn {
             // (control.sock, notify sockets) from the rest of the system.
             const klog = kmsg.init();
             boot.ensureMachineId(klog);
-            std.posix.exit(0);
+            linux.exit_group(0);
         }
     }
 

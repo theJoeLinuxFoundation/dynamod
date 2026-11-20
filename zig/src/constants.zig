@@ -21,6 +21,11 @@ pub const heartbeat_interval_s: u32 = 5;
 /// Shutdown timeout: seconds to wait after SIGTERM before SIGKILL.
 pub const shutdown_sigterm_timeout_s: u32 = 5;
 
+/// How long a shutdown asked for by a signal to PID 1 waits for the service
+/// manager to stop every service in order (with their stop commands, which
+/// may take minutes: applying a prepared upgrade, for one).
+pub const signal_shutdown_timeout_ms: i64 = 15 * 60 * 1000;
+
 /// Seconds to wait after SIGKILL before proceeding.
 pub const shutdown_sigkill_timeout_s: u32 = 2;
 
@@ -83,7 +88,10 @@ pub const udevd_path: [*:0]const u8 = "/usr/bin/udevd";
 
 pub const live_staging_base = "/run/dynamod/live";
 pub const live_iso_mp = "/run/dynamod/live/iso";
-pub const live_squash_mp = "/run/dynamod/live/squash";
+/// The live root image (read-only SquashFS). It is mounted under /run, which
+/// moves into the new root, so the live system can still read the image as
+/// it was built: joe Linux's installer copies packages out of it from here.
+pub const live_squash_mp = "/run/live/lower";
 pub const live_upper_mp = "/run/dynamod/live/upper";
 pub const live_work_mp = "/run/dynamod/live/work";
 /// Tmpfs copy of the squashfs image before loop attach (avoids loop+iso9660 hangs on some kernels).

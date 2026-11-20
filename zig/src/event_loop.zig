@@ -10,6 +10,7 @@ const shutdown = @import("shutdown.zig");
 const ipc = @import("ipc.zig");
 const emergency = @import("emergency.zig");
 const constants = @import("constants.zig");
+const sys = @import("sys.zig");
 
 const Self = @This();
 
@@ -20,7 +21,7 @@ const EventSource = enum(u64) {
     init_sock = 3,
 };
 
-epoll_fd: std.posix.fd_t,
+epoll_fd: linux.fd_t,
 sig: signal,
 svmgr: *child,
 klog: ?kmsg,
@@ -34,10 +35,16 @@ post_emergency_armed: bool,
 /// have asked the currently-running svmgr to terminate. handleSvmgrExit
 /// observes this flag and enters emergency mode instead of restarting.
 pending_emergency: bool,
+/// A shutdown asked for by a signal (SIGTERM, SIGINT, SIGUSR1), waiting for
+/// svmgr: it has been told (ShutdownSignal) and stops every service in its
+/// order, running their stop commands, before it exits. The shutdown goes
+/// ahead when it has exited, at the deadline, or at a second signal.
+pending_signal_shutdown: ?shutdown.ShutdownKind,
+signal_shutdown_deadline_ms: i64,
 
 pub fn init(sig_handler: signal, svmgr_child: *child, klog_writer: ?kmsg) !Self {
     const epfd = linux.epoll_create1(linux.EPOLL.CLOEXEC);
-    const e = linux.E.init(epfd);
+    const e = linux.errno(epfd);
     if (e != .SUCCESS) return error.EpollCreateFailed;
 
     var self = Self{
@@ -49,6 +56,8 @@ pub fn init(sig_handler: signal, svmgr_child: *child, klog_writer: ?kmsg) !Self 
         .ipc_buf = .{},
         .post_emergency_armed = false,
         .pending_emergency = false,
+        .pending_signal_shutdown = null,
+        .signal_shutdown_deadline_ms = 0,
     };
 
     // Register signalfd
@@ -57,17 +66,17 @@ pub fn init(sig_handler: signal, svmgr_child: *child, klog_writer: ?kmsg) !Self 
     return self;
 }
 
-fn addFd(self: *Self, fd: std.posix.fd_t, source: EventSource) !void {
+fn addFd(self: *Self, fd: linux.fd_t, source: EventSource) !void {
     var ev = linux.epoll_event{
         .events = linux.EPOLL.IN,
-        .data = .{ .u64 = @intFromEnum(source) },
+        .data = .{ .u64 = @backingInt(source) },
     };
     const rc = linux.epoll_ctl(self.epoll_fd, linux.EPOLL.CTL_ADD, fd, &ev);
-    const e = linux.E.init(rc);
+    const e = linux.errno(rc);
     if (e != .SUCCESS) return error.EpollCtlFailed;
 }
 
-fn removeFd(self: *Self, fd: std.posix.fd_t) void {
+fn removeFd(self: *Self, fd: linux.fd_t) void {
     _ = linux.epoll_ctl(self.epoll_fd, linux.EPOLL.CTL_DEL, fd, null);
 }
 
@@ -97,13 +106,24 @@ pub fn run(self: *Self) noreturn {
     var consecutive_errors: u32 = 0;
 
     while (true) {
-        const nfds = linux.epoll_pwait(self.epoll_fd, &events, events.len, -1, null);
-        const wait_err = linux.E.init(nfds);
+        // Wake for the deadline of a signalled shutdown, if one is waiting.
+        var timeout_ms: i32 = -1;
+        if (self.pending_signal_shutdown) |kind| {
+            const left = self.signal_shutdown_deadline_ms - sys.milliTimestamp();
+            if (left <= 0) {
+                if (self.klog) |k| k.warn("services did not stop in time; shutting down anyway", .{});
+                self.shutdown_requested = kind;
+                shutdown.execute(kind, self.klog);
+            }
+            timeout_ms = @intCast(@min(left, std.math.maxInt(i32)));
+        }
+        const nfds = linux.epoll_pwait(self.epoll_fd, &events, events.len, timeout_ms, null);
+        const wait_err = linux.errno(nfds);
 
         if (wait_err == .INTR) continue;
         if (wait_err != .SUCCESS) {
             consecutive_errors += 1;
-            if (self.klog) |k| k.err("epoll_pwait failed: errno {d} (consecutive: {d})", .{ @intFromEnum(wait_err), consecutive_errors });
+            if (self.klog) |k| k.err("epoll_pwait failed: errno {d} (consecutive: {d})", .{ @backingInt(wait_err), consecutive_errors });
 
             if (consecutive_errors >= 100) {
                 if (self.klog) |k| k.emerg("epoll_pwait failing persistently, initiating shutdown", .{});
@@ -124,7 +144,9 @@ pub fn run(self: *Self) noreturn {
 
         const n: usize = @intCast(nfds);
         for (events[0..n]) |ev| {
-            const source: EventSource = @enumFromInt(ev.data.u64);
+            // Only values we registered come back, but never trust a cast to an
+            // exhaustive enum in PID 1: an unknown tag is ignored, not a panic.
+            const source = std.enums.fromInt(EventSource, ev.data.u64) orelse continue;
             switch (source) {
                 .signal_fd => self.handleSignals(),
                 .svmgr_pidfd => self.handleSvmgrExit(),
@@ -148,8 +170,9 @@ fn handleSignals(self: *Self) void {
                 // check if our svmgr PID was reaped (kill(pid, 0) fails with ESRCH)
                 if (self.svmgr.getPidfd() == null) {
                     if (self.svmgr.pid) |pid| {
-                        const rc = linux.kill(pid, 0);
-                        if (linux.E.init(rc) == .SRCH) {
+                        // Signal 0: existence probe (SIG is a non-exhaustive enum).
+                        const rc = linux.kill(pid, @fromBackingInt(0));
+                        if (linux.errno(rc) == .SRCH) {
                             self.handleSvmgrExit();
                         }
                     }
@@ -157,25 +180,15 @@ fn handleSignals(self: *Self) void {
             },
             .shutdown_term => {
                 if (self.klog) |k| k.info("received SIGTERM", .{});
-                // Notify svmgr before shutting down
-                if (self.svmgr.getInitSockFd()) |sock| {
-                    ipc.sendShutdownSignal(sock, "SIGTERM");
-                }
-                self.shutdown_requested = .poweroff;
+                self.signalShutdown(.poweroff, "SIGTERM");
             },
             .shutdown_int => {
                 if (self.klog) |k| k.info("received SIGINT", .{});
-                if (self.svmgr.getInitSockFd()) |sock| {
-                    ipc.sendShutdownSignal(sock, "SIGINT");
-                }
-                self.shutdown_requested = .poweroff;
+                self.signalShutdown(.poweroff, "SIGINT");
             },
             .user1 => {
                 if (self.klog) |k| k.info("received SIGUSR1 (reboot)", .{});
-                if (self.svmgr.getInitSockFd()) |sock| {
-                    ipc.sendShutdownSignal(sock, "SIGUSR1");
-                }
-                self.shutdown_requested = .reboot;
+                self.signalShutdown(.reboot, "SIGUSR1");
             },
             .user2 => {
                 if (self.klog) |k| k.warn("received SIGUSR2 — operator requested emergency shell", .{});
@@ -195,12 +208,40 @@ fn handleSignals(self: *Self) void {
     }
 }
 
+/// A shutdown asked for by a signal: let svmgr stop the services first (see
+/// pending_signal_shutdown). Without a running svmgr, or at a second signal,
+/// shut down at once.
+fn signalShutdown(self: *Self, kind: shutdown.ShutdownKind, name: []const u8) void {
+    if (self.pending_signal_shutdown != null) {
+        if (self.klog) |k| k.warn("second shutdown signal: not waiting for services any longer", .{});
+        self.shutdown_requested = kind;
+        return;
+    }
+    const sock = self.svmgr.getInitSockFd() orelse {
+        self.shutdown_requested = kind;
+        return;
+    };
+    if (self.svmgr.pid == null) {
+        self.shutdown_requested = kind;
+        return;
+    }
+    ipc.sendShutdownSignal(sock, name);
+    self.pending_signal_shutdown = kind;
+    self.signal_shutdown_deadline_ms = sys.milliTimestamp() + constants.signal_shutdown_timeout_ms;
+}
+
 fn handleSvmgrExit(self: *Self) void {
     if (self.klog) |k| k.warn("dynamod-svmgr process exited", .{});
 
     // Unregister old fds, handle exit
     self.unregisterSvmgr();
     const delay_ms = self.svmgr.onExit(self.klog);
+
+    // svmgr has stopped the services for a signalled shutdown: go ahead.
+    if (self.pending_signal_shutdown) |kind| {
+        self.shutdown_requested = kind;
+        return;
+    }
 
     // Reset IPC buffer for new connection
     self.ipc_buf.len = 0;
@@ -217,7 +258,7 @@ fn handleSvmgrExit(self: *Self) void {
     // quickly, the operator's fix didn't hold — reboot. If it survived
     // the grace window, clear the flag and resume normal restarts.
     if (self.post_emergency_armed) {
-        const uptime_ms = std.time.milliTimestamp() - self.svmgr.spawn_time_ms;
+        const uptime_ms = sys.milliTimestamp() - self.svmgr.spawn_time_ms;
         if (uptime_ms < constants.svmgr_post_emergency_grace_ms) {
             if (self.klog) |k| k.emerg("svmgr died {d}ms after emergency recovery — rebooting", .{uptime_ms});
             self.shutdown_requested = .reboot;
@@ -324,4 +365,3 @@ fn handleSvmgrMessage(self: *Self) void {
         }
     }
 }
-

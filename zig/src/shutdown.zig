@@ -17,6 +17,7 @@ const linux = std.os.linux;
 const constants = @import("constants.zig");
 const kmsg = @import("kmsg.zig");
 const reaper = @import("reaper.zig");
+const sys = @import("sys.zig");
 
 pub const ShutdownKind = enum {
     poweroff,
@@ -90,19 +91,19 @@ fn waitAndReap(secs: u32, klog: ?kmsg) void {
 }
 
 fn saveRandomSeed(klog: ?kmsg) void {
-    const urandom = std.fs.openFileAbsolute("/dev/urandom", .{}) catch return;
-    defer urandom.close();
+    const urandom = sys.openFile("/dev/urandom", .read_only) catch return;
+    defer sys.close(urandom);
 
     var buf: [512]u8 = undefined;
-    const len = urandom.read(&buf) catch return;
+    const len = sys.read(urandom, &buf) catch return;
     if (len == 0) return;
 
     // Ensure parent directory exists
     _ = linux.mkdirat(@bitCast(@as(i32, linux.AT.FDCWD)), "/var/lib/dynamod", 0o755);
 
-    const seed_file = std.fs.createFileAbsolute(constants.random_seed_path, .{}) catch return;
-    defer seed_file.close();
-    _ = seed_file.write(buf[0..len]) catch return;
+    const seed_file = sys.createFile(constants.random_seed_path) catch return;
+    defer sys.close(seed_file);
+    _ = sys.write(seed_file, buf[0..len]) catch return;
 
     if (klog) |k| k.info("saved random seed ({d} bytes)", .{len});
 }
@@ -113,9 +114,10 @@ fn unmountAll(klog: ?kmsg) void {
     // beyond the 7 hardcoded pseudo-filesystems.
     var mounts_buf: [32768]u8 = undefined;
     const mounts_len = blk: {
-        const file = std.fs.openFileAbsolute("/proc/mounts", .{}) catch break :blk @as(usize, 0);
-        defer file.close();
-        break :blk file.read(&mounts_buf) catch 0;
+        const file = sys.openFile("/proc/mounts", .read_only) catch break :blk @as(usize, 0);
+        defer sys.close(file);
+        // A single read(2), as before.
+        break :blk sys.read(file, &mounts_buf) catch 0;
     };
 
     if (mounts_len > 0) {
@@ -131,7 +133,7 @@ fn unmountFromProc(data: []const u8, klog: ?kmsg) void {
     // Parse mount targets (second field in each line of /proc/mounts).
     // Store them so we can unmount in reverse order.
     var targets: [256][256]u8 = undefined;
-    var target_lens: [256]usize = .{0} ** 256;
+    var target_lens: [256]usize = @splat(0);
     var count: usize = 0;
 
     var lines = std.mem.tokenizeScalar(u8, data, '\n');
@@ -159,9 +161,9 @@ fn unmountFromProc(data: []const u8, klog: ?kmsg) void {
         const name = targets[i][0..target_lens[i]];
         const target_z: [*:0]const u8 = @ptrCast(targets[i][0..target_lens[i] :0]);
         const rc = linux.umount2(target_z, linux.MNT.DETACH);
-        const e = linux.E.init(rc);
+        const e = linux.errno(rc);
         if (e != .SUCCESS and e != .INVAL and e != .NOENT) {
-            if (klog) |k| k.warn("failed to unmount {s}: errno {d}", .{ name, @intFromEnum(e) });
+            if (klog) |k| k.warn("failed to unmount {s}: errno {d}", .{ name, @backingInt(e) });
         } else if (e == .SUCCESS) {
             if (klog) |k| k.info("unmounted {s}", .{name});
         }
@@ -183,9 +185,9 @@ fn unmountHardcoded(klog: ?kmsg) void {
     for (&targets) |target| {
         const name = std.mem.span(target);
         const rc = linux.umount2(target, linux.MNT.DETACH);
-        const e = linux.E.init(rc);
+        const e = linux.errno(rc);
         if (e != .SUCCESS and e != .INVAL and e != .NOENT) {
-            if (klog) |k| k.warn("failed to unmount {s}: errno {d}", .{ name, @intFromEnum(e) });
+            if (klog) |k| k.warn("failed to unmount {s}: errno {d}", .{ name, @backingInt(e) });
         } else if (e == .SUCCESS) {
             if (klog) |k| k.info("unmounted {s}", .{name});
         }
@@ -196,9 +198,9 @@ fn remountRootReadonly(klog: ?kmsg) void {
     const MS_REMOUNT = 0x20;
     const MS_RDONLY = 0x01;
     const rc = linux.mount("", "/", "", MS_REMOUNT | MS_RDONLY, 0);
-    const e = linux.E.init(rc);
+    const e = linux.errno(rc);
     if (e != .SUCCESS) {
-        if (klog) |k| k.warn("failed to remount / read-only: errno {d}", .{@intFromEnum(e)});
+        if (klog) |k| k.warn("failed to remount / read-only: errno {d}", .{@backingInt(e)});
     } else {
         if (klog) |k| k.info("remounted / read-only", .{});
     }
