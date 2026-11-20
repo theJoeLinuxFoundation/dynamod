@@ -13,6 +13,10 @@ const MountEntry = struct {
     fstype: [*:0]const u8,
     flags: u32,
     data: ?[*:0]const u8,
+    /// A path that must exist for this file system to be mounted, where the
+    /// kernel or the machine may not have it; it is skipped without a word
+    /// otherwise.
+    needs: ?[*:0]const u8 = null,
 };
 
 const MS_NOSUID = 0x02;
@@ -29,6 +33,11 @@ const essential_mounts = [_]MountEntry{
     // Default tmpfs cap is ~50% RAM; live boot copies the full squashfs into /run — raise limit.
     .{ .source = "tmpfs", .target = "/run", .fstype = "tmpfs", .flags = MS_NOSUID | MS_NODEV | MS_STRICTATIME, .data = "mode=0755,size=85%" },
     .{ .source = "cgroup2", .target = "/sys/fs/cgroup", .fstype = "cgroup2", .flags = MS_NOSUID | MS_NODEV | MS_NOEXEC, .data = null },
+    // The security modules' files (/sys/kernel/security/lsm and the rest).
+    .{ .source = "securityfs", .target = "/sys/kernel/security", .fstype = "securityfs", .flags = MS_NOSUID | MS_NODEV | MS_NOEXEC, .data = null, .needs = "/sys/kernel/security" },
+    // The firmware's variables, on a machine booted by UEFI: the boot
+    // loader's (systemd-boot's boot counting) and the boot entries.
+    .{ .source = "efivarfs", .target = "/sys/firmware/efi/efivars", .fstype = "efivarfs", .flags = MS_NOSUID | MS_NODEV | MS_NOEXEC, .data = null, .needs = "/sys/firmware/efi/efivars" },
 };
 
 /// Whether a directory is a mount point: it is on another device than its
@@ -45,6 +54,12 @@ fn isMountPoint(path: [*:0]const u8) bool {
     const a = deviceOf(path) orelse return false;
     const b = deviceOf(&parent_buf) orelse return false;
     return a[0] != b[0] or a[1] != b[1];
+}
+
+fn exists(path: [*:0]const u8) bool {
+    var stx: linux.Statx = undefined;
+    const rc = linux.statx(linux.AT.FDCWD, path, linux.AT.SYMLINK_NOFOLLOW, linux.STATX.BASIC_STATS, &stx);
+    return linux.errno(rc) == .SUCCESS;
 }
 
 fn deviceOf(path: [*:0]const u8) ?[2]u32 {
@@ -64,6 +79,7 @@ test "the root and /proc are mount points, /proc/self is not" {
 pub fn mountEssentialFilesystems(klog_arg: ?kmsg) void {
     for (&essential_mounts) |*entry| {
         const target = std.mem.span(entry.target);
+        if (entry.needs) |path| if (!exists(path)) continue;
 
         // Create mount point if it doesn't exist (use raw syscall for sentinel ptr)
         _ = linux.mkdirat(@bitCast(@as(i32, linux.AT.FDCWD)), entry.target, 0o755);
