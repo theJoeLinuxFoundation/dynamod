@@ -4,25 +4,30 @@
 /// Each connection handles one request-response exchange.
 use std::io::{Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
+use dynamod_common::config_dirs;
 use dynamod_common::protocol::{
-    self, Message, MessageBody, MessageKind, ServiceEntry,
+    self, Message, MessageBody, MessageKind, ServiceDetails, ServiceEntry,
 };
 
-use crate::supervisor::lifecycle::ServiceState;
 use crate::supervisor::tree::{SupervisorTree, TreeNode};
 
 /// The control socket server.
 pub struct ControlServer {
     listener: UnixListener,
+    /// Alternative root for the enable/disable markers ($DYNAMOD_ROOT).
+    root: Option<PathBuf>,
 }
 
 impl ControlServer {
     /// Create and bind the control socket.
-    pub fn bind(path: &Path) -> Result<Self, std::io::Error> {
+    pub fn bind(path: &Path, root: Option<PathBuf>) -> Result<Self, std::io::Error> {
         // Remove stale socket file
         let _ = std::fs::remove_file(path);
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
 
         let listener = UnixListener::bind(path)?;
         listener.set_nonblocking(true)?;
@@ -35,7 +40,7 @@ impl ControlServer {
         }
 
         tracing::info!("control socket listening at {}", path.display());
-        Ok(Self { listener })
+        Ok(Self { listener, root })
     }
 
     /// Accept and handle any pending connections (non-blocking).
@@ -45,15 +50,13 @@ impl ControlServer {
 
         loop {
             match self.listener.accept() {
-                Ok((stream, _)) => {
-                    match handle_connection(stream, tree) {
-                        Ok(Some(action)) => actions.push(action),
-                        Ok(None) => {}
-                        Err(e) => {
-                            tracing::debug!("control connection error: {e}");
-                        }
+                Ok((stream, _)) => match handle_connection(stream, tree, self.root.as_deref()) {
+                    Ok(Some(action)) => actions.push(action),
+                    Ok(None) => {}
+                    Err(e) => {
+                        tracing::debug!("control connection error: {e}");
                     }
-                }
+                },
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
                 Err(e) => {
                     tracing::warn!("control socket accept error: {e}");
@@ -74,16 +77,18 @@ pub enum ControlAction {
     RestartService(String),
     Reload,
     Shutdown(dynamod_common::protocol::ShutdownKind),
+    ScheduleShutdown(dynamod_common::protocol::ShutdownKind, u64),
+    CancelShutdown,
 }
 
 /// Handle a single control connection: read request, generate response, write response.
 fn handle_connection(
     mut stream: UnixStream,
     tree: &SupervisorTree,
+    root: Option<&Path>,
 ) -> Result<Option<ControlAction>, Box<dyn std::error::Error>> {
     stream.set_nonblocking(false)?;
-    stream
-        .set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
+    stream.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
 
     // Read until we have a complete framed message (kernel may split writes)
     let mut buf = vec![0u8; protocol::HEADER_SIZE + protocol::MAX_MESSAGE_SIZE as usize];
@@ -105,7 +110,7 @@ fn handle_connection(
     }
 
     let (msg, _) = protocol::decode(&buf[..filled])?;
-    let (response_body, action) = handle_request(msg.body, tree);
+    let (response_body, action) = handle_request(msg.body, tree, root);
 
     // Send response
     let response = Message {
@@ -126,6 +131,7 @@ fn handle_connection(
 fn handle_request(
     body: MessageBody,
     tree: &SupervisorTree,
+    root: Option<&Path>,
 ) -> (MessageBody, Option<ControlAction>) {
     match body {
         MessageBody::StartService { name } => {
@@ -154,10 +160,7 @@ fn handle_request(
         }
         MessageBody::RestartService { name } => {
             if tree.get_worker(&name).is_some() {
-                (
-                    MessageBody::Ack,
-                    Some(ControlAction::RestartService(name)),
-                )
+                (MessageBody::Ack, Some(ControlAction::RestartService(name)))
             } else {
                 (
                     MessageBody::Error {
@@ -193,6 +196,9 @@ fn handle_request(
                         name: name.to_string(),
                         status: w.state.display_name().to_string(),
                         pid: w.pid,
+                        enabled: Some(
+                            config_dirs::enablement(root, name, w.def.service.enabled).enabled,
+                        ),
                     })
                 })
                 .collect();
@@ -202,16 +208,44 @@ fn handle_request(
             let text = format_tree(tree, tree.root_id(), 0);
             (MessageBody::Tree { text }, None)
         }
-        MessageBody::Shutdown { kind } => {
-            (MessageBody::Ack, Some(ControlAction::Shutdown(kind)))
-        }
-        MessageBody::Reload => {
-            (MessageBody::Ack, Some(ControlAction::Reload))
-        }
+        MessageBody::Shutdown { kind } => (MessageBody::Ack, Some(ControlAction::Shutdown(kind))),
+        MessageBody::Reload => (MessageBody::Ack, Some(ControlAction::Reload)),
         MessageBody::GetServiceByPid { pid } => {
             let name = tree.worker_for_pid(pid).map(|s| s.to_string());
             (MessageBody::ServiceByPid { name, pid }, None)
         }
+        MessageBody::DescribeService { name } => match tree.get_worker(&name) {
+            Some(w) => {
+                let def = &w.def;
+                let enablement = config_dirs::enablement(root, &name, def.service.enabled);
+                let details = ServiceDetails {
+                    name: name.clone(),
+                    status: w.state.display_name().to_string(),
+                    pid: w.pid,
+                    supervisor: w.parent.clone(),
+                    enabled: enablement.enabled,
+                    enabled_source: enablement.source_name().to_string(),
+                    service_type: def.service.service_type.as_str().to_string(),
+                    remain_after_exit: def.service.remain_after_exit,
+                    after_all: def.dependencies.after_all,
+                    last: def.shutdown.last,
+                    failure_action: def.service.failure_action.as_str().to_string(),
+                    source: def.source.as_ref().map(|p| p.display().to_string()),
+                };
+                (MessageBody::ServiceDetails(details), None)
+            }
+            None => (
+                MessageBody::Error {
+                    message: format!("unknown service: {name}"),
+                },
+                None,
+            ),
+        },
+        MessageBody::ScheduleShutdown { kind, at } => (
+            MessageBody::Ack,
+            Some(ControlAction::ScheduleShutdown(kind, at)),
+        ),
+        MessageBody::CancelShutdown => (MessageBody::Ack, Some(ControlAction::CancelShutdown)),
         _ => (
             MessageBody::Error {
                 message: "unknown command".to_string(),
@@ -237,10 +271,7 @@ fn format_tree(tree: &SupervisorTree, node_id: &str, depth: usize) -> String {
             }
         }
         Some(TreeNode::Worker(w)) => {
-            let pid_str = w
-                .pid
-                .map(|p| format!(" pid={p}"))
-                .unwrap_or_default();
+            let pid_str = w.pid.map(|p| format!(" pid={p}")).unwrap_or_default();
             output.push_str(&format!(
                 "{indent}{node_id} [{}]{pid_str}\n",
                 w.state.display_name()

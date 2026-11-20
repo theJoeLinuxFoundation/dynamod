@@ -8,3 +8,5 @@ dynamod-common = { path = "../dynamod-common" }
 clap = { workspace = true }
 serde = { workspace = true }
 rmp-serde = { workspace = true }
+toml = { workspace = true }
+libc = "0.2"

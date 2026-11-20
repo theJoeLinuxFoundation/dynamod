@@ -13,6 +13,9 @@ pub enum ServiceState {
     Starting,
     /// Running and ready.
     Running,
+    /// A `remain-after-exit` oneshot exited successfully and stays active
+    /// until stopped (systemd's "active (exited)").
+    Exited,
     /// Stop signal sent, waiting for exit.
     Stopping { deadline: Option<Instant> },
     /// Exited with failure.
@@ -29,6 +32,14 @@ impl ServiceState {
         matches!(self, ServiceState::Running | ServiceState::Starting)
     }
 
+    /// Running, starting, or a remain-after-exit oneshot that is still active.
+    pub fn is_active(&self) -> bool {
+        matches!(
+            self,
+            ServiceState::Running | ServiceState::Starting | ServiceState::Exited
+        )
+    }
+
     pub fn is_stopped(&self) -> bool {
         matches!(
             self,
@@ -41,6 +52,7 @@ impl ServiceState {
             ServiceState::Stopped => "stopped",
             ServiceState::Starting => "starting",
             ServiceState::Running => "running",
+            ServiceState::Exited => "exited",
             ServiceState::Stopping { .. } => "stopping",
             ServiceState::Failed { .. } => "failed",
             ServiceState::Abandoned => "abandoned",

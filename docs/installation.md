@@ -107,8 +107,13 @@ sudo xbps-install -R hostdir/binpkgs dynamod
 /usr/lib/dynamod/dynamod-sd1bridge # systemd1 D-Bus bridge
 /usr/lib/dynamod/dynamod-hostnamed # hostname1/timedate1/locale1
 /usr/bin/dynamodctl                 # CLI tool
-/etc/dynamod/services/*.toml        # Service definitions
-/etc/dynamod/supervisors/*.toml     # Supervisor tree definitions
+/usr/bin/systemctl -> dynamodctl    # systemctl front end (multi-call)
+/usr/sbin/{reboot,poweroff,halt,shutdown} -> ../bin/dynamodctl
+/usr/lib/dynamod/services/*.toml    # Service definitions from packages
+/usr/lib/dynamod/supervisors/*.toml # Supervisor definitions from packages
+/etc/dynamod/services/*.toml        # Administrator's services (override /usr/lib)
+/etc/dynamod/supervisors/*.toml     # Administrator's supervisors
+/etc/dynamod/{enabled,disabled}/    # `dynamodctl enable/disable` markers
 /usr/share/dbus-1/system.d/*.conf   # D-Bus policy files
 ```
 

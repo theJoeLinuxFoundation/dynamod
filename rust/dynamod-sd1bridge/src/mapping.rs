@@ -3,9 +3,7 @@
 /// Strip the `.service` suffix from a systemd unit name to get the
 /// dynamod service name.
 pub fn unit_to_service(unit_name: &str) -> &str {
-    unit_name
-        .strip_suffix(".service")
-        .unwrap_or(unit_name)
+    unit_name.strip_suffix(".service").unwrap_or(unit_name)
 }
 
 /// Append `.service` to a dynamod service name to get a systemd unit name.
@@ -21,6 +19,8 @@ pub fn service_to_unit(service_name: &str) -> String {
 pub fn map_status(dynamod_status: &str) -> (&'static str, &'static str) {
     match dynamod_status {
         "running" => ("active", "running"),
+        // A oneshot with remain-after-exit that has run: systemd says the same.
+        "exited" => ("active", "exited"),
         "stopped" => ("inactive", "dead"),
         "starting" => ("activating", "start"),
         "waiting-ready" => ("activating", "start"),
@@ -47,11 +47,7 @@ pub fn escape_unit_path(unit_name: &str) -> String {
             out.push_str(&format!("_{:02x}", b));
         }
     }
-    if out.is_empty() {
-        "_".to_string()
-    } else {
-        out
-    }
+    if out.is_empty() { "_".to_string() } else { out }
 }
 
 /// Build the D-Bus object path for a unit.

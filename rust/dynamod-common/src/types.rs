@@ -31,8 +31,13 @@ pub enum ServiceStatus {
     Starting,
     WaitingReady,
     Running,
+    /// A `remain-after-exit` oneshot that exited successfully: still active.
+    Exited,
     Stopping,
-    Failed { exit_code: Option<i32>, signal: Option<i32> },
+    Failed {
+        exit_code: Option<i32>,
+        signal: Option<i32>,
+    },
     Abandoned,
 }
 
@@ -43,6 +48,7 @@ impl fmt::Display for ServiceStatus {
             ServiceStatus::Starting => write!(f, "starting"),
             ServiceStatus::WaitingReady => write!(f, "waiting-ready"),
             ServiceStatus::Running => write!(f, "running"),
+            ServiceStatus::Exited => write!(f, "exited"),
             ServiceStatus::Stopping => write!(f, "stopping"),
             ServiceStatus::Failed { exit_code, signal } => {
                 write!(f, "failed(")?;
@@ -68,6 +74,7 @@ impl FromStr for ServiceStatus {
             "starting" => Ok(ServiceStatus::Starting),
             "waiting-ready" => Ok(ServiceStatus::WaitingReady),
             "running" => Ok(ServiceStatus::Running),
+            "exited" => Ok(ServiceStatus::Exited),
             "stopping" => Ok(ServiceStatus::Stopping),
             "abandoned" => Ok(ServiceStatus::Abandoned),
             other if other.starts_with("failed(") => {
@@ -79,11 +86,15 @@ impl FromStr for ServiceStatus {
                 let mut signal = None;
                 for part in inner.split("signal=") {
                     if let Some(rest) = part.strip_prefix("exit=") {
-                        exit_code = rest.trim_end_matches(|c: char| !c.is_ascii_digit())
-                            .parse().ok();
+                        exit_code = rest
+                            .trim_end_matches(|c: char| !c.is_ascii_digit())
+                            .parse()
+                            .ok();
                     } else if !part.is_empty() {
-                        signal = part.trim_end_matches(|c: char| !c.is_ascii_digit())
-                            .parse().ok();
+                        signal = part
+                            .trim_end_matches(|c: char| !c.is_ascii_digit())
+                            .parse()
+                            .ok();
                     }
                 }
                 Ok(ServiceStatus::Failed { exit_code, signal })
@@ -181,12 +192,30 @@ mod tests {
 
     #[test]
     fn service_status_from_str_simple() {
-        assert_eq!("stopped".parse::<ServiceStatus>().unwrap(), ServiceStatus::Stopped);
-        assert_eq!("running".parse::<ServiceStatus>().unwrap(), ServiceStatus::Running);
-        assert_eq!("starting".parse::<ServiceStatus>().unwrap(), ServiceStatus::Starting);
-        assert_eq!("stopping".parse::<ServiceStatus>().unwrap(), ServiceStatus::Stopping);
-        assert_eq!("waiting-ready".parse::<ServiceStatus>().unwrap(), ServiceStatus::WaitingReady);
-        assert_eq!("abandoned".parse::<ServiceStatus>().unwrap(), ServiceStatus::Abandoned);
+        assert_eq!(
+            "stopped".parse::<ServiceStatus>().unwrap(),
+            ServiceStatus::Stopped
+        );
+        assert_eq!(
+            "running".parse::<ServiceStatus>().unwrap(),
+            ServiceStatus::Running
+        );
+        assert_eq!(
+            "starting".parse::<ServiceStatus>().unwrap(),
+            ServiceStatus::Starting
+        );
+        assert_eq!(
+            "stopping".parse::<ServiceStatus>().unwrap(),
+            ServiceStatus::Stopping
+        );
+        assert_eq!(
+            "waiting-ready".parse::<ServiceStatus>().unwrap(),
+            ServiceStatus::WaitingReady
+        );
+        assert_eq!(
+            "abandoned".parse::<ServiceStatus>().unwrap(),
+            ServiceStatus::Abandoned
+        );
     }
 
     #[test]
@@ -194,7 +223,10 @@ mod tests {
         let status: ServiceStatus = "failed(exit=1)".parse().unwrap();
         assert_eq!(
             status,
-            ServiceStatus::Failed { exit_code: Some(1), signal: None }
+            ServiceStatus::Failed {
+                exit_code: Some(1),
+                signal: None
+            }
         );
     }
 
@@ -212,6 +244,7 @@ mod tests {
             ServiceStatus::Stopping,
             ServiceStatus::WaitingReady,
             ServiceStatus::Abandoned,
+            ServiceStatus::Exited,
         ];
         for status in statuses {
             let displayed = format!("{status}");

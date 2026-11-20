@@ -62,6 +62,13 @@ pub enum MessageBody {
     Shutdown { kind: ShutdownKind },
     /// Look up the service that owns a given PID.
     GetServiceByPid { pid: i32 },
+    /// Detailed status of one service (answered with ServiceDetails).
+    DescribeService { name: String },
+    /// Shut down at a wall-clock time (seconds since the Unix epoch),
+    /// replacing any shutdown scheduled before.
+    ScheduleShutdown { kind: ShutdownKind, at: u64 },
+    /// Cancel a scheduled shutdown (Ack even if none was scheduled).
+    CancelShutdown,
 
     // === Responses ===
     /// Generic acknowledgment.
@@ -80,10 +87,32 @@ pub enum MessageBody {
     /// Supervisor tree response.
     Tree { text: String },
     /// Response to GetServiceByPid.
-    ServiceByPid {
-        name: Option<String>,
-        pid: i32,
-    },
+    ServiceByPid { name: Option<String>, pid: i32 },
+    /// Response to DescribeService.
+    ServiceDetails(ServiceDetails),
+}
+
+/// Everything `dynamodctl status` / `systemctl status` shows about a service.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ServiceDetails {
+    pub name: String,
+    /// Same strings as ServiceInfo.status ("running", "exited", "failed", ...).
+    pub status: String,
+    pub pid: Option<i32>,
+    pub supervisor: String,
+    /// Started at boot (definition's `enabled`, overridden by the markers).
+    pub enabled: bool,
+    /// Where `enabled` comes from: "definition", "enabled marker", "disabled marker".
+    pub enabled_source: String,
+    /// "simple", "oneshot", "forking" or "notify".
+    pub service_type: String,
+    pub remain_after_exit: bool,
+    pub after_all: bool,
+    pub last: bool,
+    /// "none", "reboot", "poweroff" or "reboot-force".
+    pub failure_action: String,
+    /// The definition file the service was loaded from.
+    pub source: Option<String>,
 }
 
 /// A service entry in a list response.
@@ -92,10 +121,13 @@ pub struct ServiceEntry {
     pub name: String,
     pub status: String,
     pub pid: Option<i32>,
+    /// Started at boot (absent from older svmgr versions).
+    #[serde(default)]
+    pub enabled: Option<bool>,
 }
 
 /// Shutdown kind for the RequestShutdown message.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum ShutdownKind {
     Poweroff,
     Reboot,
@@ -112,8 +144,7 @@ pub const PROTOCOL_VERSION: u8 = 1;
 pub fn encode(msg: &Message) -> Result<Vec<u8>, EncodeError> {
     let mut buf = Vec::new();
     let mut serializer = rmp_serde::Serializer::new(&mut buf).with_struct_map();
-    serde::Serialize::serialize(msg, &mut serializer)
-        .map_err(EncodeError::Serialize)?;
+    serde::Serialize::serialize(msg, &mut serializer).map_err(EncodeError::Serialize)?;
     let payload = buf;
 
     if payload.len() > MAX_MESSAGE_SIZE as usize {
@@ -148,8 +179,7 @@ pub fn decode(buf: &[u8]) -> Result<(Message, usize), DecodeError> {
         return Err(DecodeError::Incomplete);
     }
 
-    let msg =
-        rmp_serde::from_slice(&buf[HEADER_SIZE..total]).map_err(DecodeError::Deserialize)?;
+    let msg = rmp_serde::from_slice(&buf[HEADER_SIZE..total]).map_err(DecodeError::Deserialize)?;
     Ok((msg, total))
 }
 
@@ -207,13 +237,20 @@ mod tests {
         };
         let encoded = encode(&msg).unwrap();
         let (decoded, _) = decode(&encoded).unwrap();
-        assert!(matches!(decoded.kind, MessageKind::Response { in_reply_to: 1 }));
+        assert!(matches!(
+            decoded.kind,
+            MessageKind::Response { in_reply_to: 1 }
+        ));
         assert!(matches!(decoded.body, MessageBody::HeartbeatAck));
     }
 
     #[test]
     fn encode_decode_roundtrip_shutdown() {
-        for kind in [ShutdownKind::Poweroff, ShutdownKind::Reboot, ShutdownKind::Halt] {
+        for kind in [
+            ShutdownKind::Poweroff,
+            ShutdownKind::Reboot,
+            ShutdownKind::Halt,
+        ] {
             let msg = make_msg(MessageBody::RequestShutdown { kind: kind.clone() });
             let encoded = encode(&msg).unwrap();
             let (decoded, _) = decode(&encoded).unwrap();
@@ -246,11 +283,13 @@ mod tests {
                 name: "sshd".to_string(),
                 status: "running".to_string(),
                 pid: Some(1234),
+                enabled: Some(true),
             },
             ServiceEntry {
                 name: "network".to_string(),
                 status: "stopped".to_string(),
                 pid: None,
+                enabled: None,
             },
         ];
         let msg = make_msg(MessageBody::ServiceList {
@@ -265,6 +304,8 @@ mod tests {
                 assert_eq!(services[0].pid, Some(1234));
                 assert_eq!(services[1].name, "network");
                 assert_eq!(services[1].pid, None);
+                assert_eq!(services[0].enabled, Some(true));
+                assert_eq!(services[1].enabled, None);
             }
             other => panic!("expected ServiceList, got {other:?}"),
         }
@@ -418,5 +459,64 @@ mod tests {
             }
             other => panic!("expected ServiceByPid, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn encode_decode_schedule_and_details() {
+        let msg = make_msg(MessageBody::ScheduleShutdown {
+            kind: ShutdownKind::Reboot,
+            at: 1_700_000_000,
+        });
+        let (decoded, _) = decode(&encode(&msg).unwrap()).unwrap();
+        match decoded.body {
+            MessageBody::ScheduleShutdown { kind, at } => {
+                assert_eq!(kind, ShutdownKind::Reboot);
+                assert_eq!(at, 1_700_000_000);
+            }
+            other => panic!("expected ScheduleShutdown, got {other:?}"),
+        }
+
+        let details = ServiceDetails {
+            name: "dave-finalize".into(),
+            status: "exited".into(),
+            pid: None,
+            supervisor: "root".into(),
+            enabled: true,
+            enabled_source: "definition".into(),
+            service_type: "oneshot".into(),
+            remain_after_exit: true,
+            after_all: false,
+            last: true,
+            failure_action: "none".into(),
+            source: Some("/usr/lib/dynamod/services/dave-finalize.toml".into()),
+        };
+        let msg = make_msg(MessageBody::ServiceDetails(details.clone()));
+        let (decoded, _) = decode(&encode(&msg).unwrap()).unwrap();
+        match decoded.body {
+            MessageBody::ServiceDetails(d) => assert_eq!(d, details),
+            other => panic!("expected ServiceDetails, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn service_entry_without_enabled_field_decodes() {
+        // An entry from an svmgr that predates `enabled`.
+        #[derive(Serialize)]
+        struct OldEntry {
+            name: String,
+            status: String,
+            pid: Option<i32>,
+        }
+        let mut buf = Vec::new();
+        let mut ser = rmp_serde::Serializer::new(&mut buf).with_struct_map();
+        OldEntry {
+            name: "a".into(),
+            status: "running".into(),
+            pid: None,
+        }
+        .serialize(&mut ser)
+        .unwrap();
+        let entry: ServiceEntry = rmp_serde::from_slice(&buf).unwrap();
+        assert_eq!(entry.enabled, None);
     }
 }

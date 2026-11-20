@@ -1,10 +1,13 @@
 use serde::Deserialize;
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// A parsed service definition from a TOML file.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ServiceDef {
+    /// The file this definition was loaded from (not part of the TOML).
+    #[serde(skip)]
+    pub source: Option<PathBuf>,
     pub service: ServiceSection,
     #[serde(default)]
     pub restart: RestartSection,
@@ -37,6 +40,43 @@ pub struct ServiceSection {
     pub environment_file: Option<String>,
     #[serde(default)]
     pub user: Option<UserSection>,
+    /// Start at boot. The administrator overrides it with
+    /// /etc/dynamod/{enabled,disabled}/NAME.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// For `type = "oneshot"`: after a successful exit the service stays
+    /// active ("exited") until stopped, and stopping it runs `stop-exec`.
+    #[serde(rename = "remain-after-exit", default)]
+    pub remain_after_exit: bool,
+    /// What to do with the machine when this service fails.
+    #[serde(rename = "failure-action", default)]
+    pub failure_action: FailureAction,
+}
+
+/// `[service] failure-action`.
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum FailureAction {
+    /// Nothing beyond the restart policy (default).
+    #[default]
+    None,
+    /// Clean reboot: stop services, then dynamod-init reboots.
+    Reboot,
+    /// Clean poweroff.
+    Poweroff,
+    /// sync and reboot(2) at once, without stopping services.
+    RebootForce,
+}
+
+impl FailureAction {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            FailureAction::None => "none",
+            FailureAction::Reboot => "reboot",
+            FailureAction::Poweroff => "poweroff",
+            FailureAction::RebootForce => "reboot-force",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -54,6 +94,17 @@ pub enum ServiceType {
     Oneshot,
     Forking,
     Notify,
+}
+
+impl ServiceType {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ServiceType::Simple => "simple",
+            ServiceType::Oneshot => "oneshot",
+            ServiceType::Forking => "forking",
+            ServiceType::Notify => "notify",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -109,6 +160,10 @@ pub struct DependencySection {
     pub after: Vec<String>,
     #[serde(default)]
     pub before: Vec<String>,
+    /// Start only once every other service started at boot is ready,
+    /// failed or blocked.
+    #[serde(rename = "after-all", default)]
+    pub after_all: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -156,19 +211,46 @@ pub struct ShutdownSection {
     #[serde(rename = "stop-exec")]
     #[serde(default)]
     pub stop_exec: Option<Vec<String>>,
+    /// At shutdown, stop this service only after every service without
+    /// `last` has stopped.
+    #[serde(default)]
+    pub last: bool,
 }
 
 // Defaults
-fn default_supervisor() -> String { "root".into() }
-fn default_service_type() -> ServiceType { ServiceType::Simple }
-fn default_restart_policy() -> RestartPolicy { RestartPolicy::Permanent }
-fn default_delay() -> String { "1s".into() }
-fn default_max_restarts() -> u32 { 5 }
-fn default_max_restart_window() -> String { "60s".into() }
-fn default_readiness_type() -> ReadinessType { ReadinessType::None }
-fn default_readiness_timeout() -> String { "30s".into() }
-fn default_stop_signal() -> String { "SIGTERM".into() }
-fn default_stop_timeout() -> String { "10s".into() }
+fn default_true() -> bool {
+    true
+}
+fn default_supervisor() -> String {
+    "root".into()
+}
+fn default_service_type() -> ServiceType {
+    ServiceType::Simple
+}
+fn default_restart_policy() -> RestartPolicy {
+    RestartPolicy::Permanent
+}
+fn default_delay() -> String {
+    "1s".into()
+}
+fn default_max_restarts() -> u32 {
+    5
+}
+fn default_max_restart_window() -> String {
+    "60s".into()
+}
+fn default_readiness_type() -> ReadinessType {
+    ReadinessType::None
+}
+fn default_readiness_timeout() -> String {
+    "30s".into()
+}
+fn default_stop_signal() -> String {
+    "SIGTERM".into()
+}
+fn default_stop_timeout() -> String {
+    "10s".into()
+}
 
 impl Default for RestartSection {
     fn default() -> Self {
@@ -199,6 +281,7 @@ impl Default for DependencySection {
             wants: vec![],
             after: vec![],
             before: vec![],
+            after_all: false,
         }
     }
 }
@@ -209,6 +292,7 @@ impl Default for ShutdownSection {
             stop_signal: default_stop_signal(),
             stop_timeout: default_stop_timeout(),
             stop_exec: None,
+            last: false,
         }
     }
 }
@@ -222,27 +306,29 @@ pub fn load_service(path: &Path) -> Result<ServiceDef, ServiceLoadError> {
     Ok(def)
 }
 
-/// Load all service definitions from a directory.
-pub fn load_services_dir(dir: &Path) -> Result<Vec<ServiceDef>, ServiceLoadError> {
+/// Load the service definitions of `dirs` (lowest precedence first): a file
+/// in a later directory replaces the one of the same name in an earlier
+/// directory; a mask (symlink to /dev/null, or empty file) removes it.
+/// Files that fail to parse are skipped with a warning.
+pub fn load_services(dirs: &[PathBuf]) -> Vec<ServiceDef> {
     let mut services = Vec::new();
-
-    let entries = std::fs::read_dir(dir)
-        .map_err(|e| ServiceLoadError::Io(dir.display().to_string(), e))?;
-
-    for entry in entries {
-        let entry = entry.map_err(|e| ServiceLoadError::Io(dir.display().to_string(), e))?;
-        let path = entry.path();
-        if path.extension().is_some_and(|ext| ext == "toml") {
-            match load_service(&path) {
-                Ok(def) => services.push(def),
-                Err(e) => {
-                    tracing::warn!("skipping {}: {e}", path.display());
-                }
+    for file in dynamod_common::config_dirs::merge_dirs(dirs) {
+        if file.masked {
+            tracing::info!("{} is masked by {}", file.file_name, file.path.display());
+            continue;
+        }
+        for old in &file.replaces {
+            tracing::info!("{} replaces {}", file.path.display(), old.display());
+        }
+        match load_service(&file.path) {
+            Ok(mut def) => {
+                def.source = Some(file.path.clone());
+                services.push(def);
             }
+            Err(e) => tracing::warn!("skipping {}: {e}", file.path.display()),
         }
     }
-
-    Ok(services)
+    services
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -306,5 +392,101 @@ stop-timeout = "5s"
         assert_eq!(def.service.service_type, ServiceType::Oneshot);
         assert_eq!(def.restart.policy, RestartPolicy::Temporary);
         assert_eq!(def.service.supervisor, "root");
+        // New fields default to the old behaviour.
+        assert!(def.service.enabled);
+        assert!(!def.service.remain_after_exit);
+        assert_eq!(def.service.failure_action, FailureAction::None);
+        assert!(!def.dependencies.after_all);
+        assert!(!def.shutdown.last);
+    }
+
+    #[test]
+    fn test_parse_new_fields() {
+        let toml_str = r#"
+[service]
+name = "dave-finalize"
+exec = ["/bin/true"]
+type = "oneshot"
+enabled = false
+remain-after-exit = true
+failure-action = "reboot-force"
+
+[dependencies]
+after-all = true
+
+[shutdown]
+stop-exec = ["/usr/bin/dave", "finalize"]
+last = true
+"#;
+        let def: ServiceDef = toml::from_str(toml_str).unwrap();
+        assert!(!def.service.enabled);
+        assert!(def.service.remain_after_exit);
+        assert_eq!(def.service.failure_action, FailureAction::RebootForce);
+        assert!(def.dependencies.after_all);
+        assert!(def.shutdown.last);
+
+        for (text, action) in [
+            ("none", FailureAction::None),
+            ("reboot", FailureAction::Reboot),
+            ("poweroff", FailureAction::Poweroff),
+            ("reboot-force", FailureAction::RebootForce),
+        ] {
+            let t = format!(
+                "[service]\nname = \"x\"\nexec = [\"/bin/true\"]\nfailure-action = \"{text}\"\n"
+            );
+            let def: ServiceDef = toml::from_str(&t).unwrap();
+            assert_eq!(def.service.failure_action, action);
+            assert_eq!(action.as_str(), text);
+        }
+        let bad = "[service]\nname = \"x\"\nexec = [\"/bin/true\"]\nfailure-action = \"explode\"\n";
+        assert!(toml::from_str::<ServiceDef>(bad).is_err());
+    }
+
+    fn temp_root(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("dynamod-svmgr-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn write(path: &Path, content: &str) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, content).unwrap();
+    }
+
+    #[test]
+    fn test_load_services_precedence_and_masking() {
+        let root = temp_root("load");
+        let dirs = dynamod_common::paths::service_dirs(Some(&root));
+        let svc =
+            |name: &str, exec: &str| format!("[service]\nname = \"{name}\"\nexec = [\"{exec}\"]\n");
+        write(&dirs[0].join("sshd.toml"), &svc("sshd", "/usr/sbin/sshd"));
+        write(&dirs[0].join("udev.toml"), &svc("udev", "/sbin/udevd"));
+        write(&dirs[0].join("dhcpcd.toml"), &svc("dhcpcd", "/sbin/dhcpcd"));
+        write(&dirs[0].join("broken.toml"), "not toml [");
+        // The administrator replaces sshd, masks dhcpcd, adds a service.
+        write(
+            &dirs[1].join("sshd.toml"),
+            &svc("sshd", "/usr/local/sbin/sshd"),
+        );
+        std::os::unix::fs::symlink("/dev/null", dirs[1].join("dhcpcd.toml")).unwrap();
+        write(&dirs[1].join("local.toml"), &svc("local", "/bin/true"));
+
+        let defs = load_services(&dirs);
+        let mut names: Vec<&str> = defs.iter().map(|d| d.service.name.as_str()).collect();
+        names.sort();
+        assert_eq!(names, vec!["local", "sshd", "udev"]);
+        let sshd = defs.iter().find(|d| d.service.name == "sshd").unwrap();
+        assert_eq!(sshd.service.exec, vec!["/usr/local/sbin/sshd"]);
+        assert_eq!(
+            sshd.source.as_deref(),
+            Some(dirs[1].join("sshd.toml").as_path())
+        );
+        let udev = defs.iter().find(|d| d.service.name == "udev").unwrap();
+        assert_eq!(
+            udev.source.as_deref(),
+            Some(dirs[0].join("udev.toml").as_path())
+        );
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }

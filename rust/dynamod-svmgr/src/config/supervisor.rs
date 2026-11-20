@@ -1,5 +1,5 @@
 use serde::Deserialize;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use super::service::ServiceLoadError;
 
@@ -64,30 +64,25 @@ pub fn load_supervisor(path: &Path) -> Result<SupervisorDef, ServiceLoadError> {
     Ok(def)
 }
 
-/// Load all supervisor definitions from a directory.
-pub fn load_supervisors_dir(dir: &Path) -> Result<Vec<SupervisorDef>, ServiceLoadError> {
+/// Load the supervisor definitions of `dirs` (lowest precedence first),
+/// with the same replace-by-file-name and masking rules as services.
+pub fn load_supervisors(dirs: &[PathBuf]) -> Vec<SupervisorDef> {
     let mut supervisors = Vec::new();
-
-    let entries = match std::fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(supervisors),
-        Err(e) => return Err(ServiceLoadError::Io(dir.display().to_string(), e)),
-    };
-
-    for entry in entries {
-        let entry = entry.map_err(|e| ServiceLoadError::Io(dir.display().to_string(), e))?;
-        let path = entry.path();
-        if path.extension().is_some_and(|ext| ext == "toml") {
-            match load_supervisor(&path) {
-                Ok(def) => supervisors.push(def),
-                Err(e) => {
-                    tracing::warn!("skipping supervisor {}: {e}", path.display());
-                }
-            }
+    for file in dynamod_common::config_dirs::merge_dirs(dirs) {
+        if file.masked {
+            tracing::info!(
+                "supervisor {} is masked by {}",
+                file.file_name,
+                file.path.display()
+            );
+            continue;
+        }
+        match load_supervisor(&file.path) {
+            Ok(def) => supervisors.push(def),
+            Err(e) => tracing::warn!("skipping supervisor {}: {e}", file.path.display()),
         }
     }
-
-    Ok(supervisors)
+    supervisors
 }
 
 #[cfg(test)]

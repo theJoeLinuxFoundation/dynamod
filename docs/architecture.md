@@ -1,6 +1,8 @@
 # Architecture
 
-dynamod is a Linux-only PID 1 init system with a microkernel-inspired design.
+dynamod is a Linux-only PID 1 init system with a microkernel-inspired design
+(the Rust parts also build for `aarch64-linux-android`, i.e. against bionic on
+an ordinary Linux system).
 Each component runs as its own process, communicating over Unix domain sockets
 with MessagePack-framed messages. The init itself is intentionally tiny — all
 the interesting logic lives in the service manager.
@@ -82,13 +84,19 @@ The service manager — the "brain" of the system.
 
 **What it does:**
 
-- Parses TOML service and supervisor configurations from `/etc/dynamod/`
+- Parses TOML service and supervisor configurations from `/usr/lib/dynamod/`
+  (packages) and `/etc/dynamod/` (administrator; same file name replaces,
+  a symlink to `/dev/null` masks)
+- Starts the *enabled* services at boot (definition's `enabled`, overridden
+  by `/etc/dynamod/{enabled,disabled}/NAME`) and what they require or want
 - Builds and validates the dependency DAG (rejects cycles)
 - Manages OTP-style supervisor trees (see below)
 - Spawns services via `fork`/`exec` with namespace and cgroup isolation
 - Runs a dynamic frontier algorithm for maximum-parallelism startup
 - Detects readiness via sd_notify, TCP port, exec check, or file descriptor
-- Handles graceful shutdown in reverse dependency order
+- Handles graceful shutdown in reverse dependency order (`last` services at the end)
+- Performs services' failure actions (reboot, poweroff, reboot-force) and
+  shutdowns scheduled with `shutdown +M` / `shutdown HH:MM`
 - Listens on `/run/dynamod/control.sock` for `dynamodctl` commands
 - Maintains a heartbeat protocol with dynamod-init (5s interval)
 
@@ -97,14 +105,30 @@ The service manager — the "brain" of the system.
 CLI tool for operators. Connects to the control socket.
 
 ```
-dynamodctl list              # List all services with status
+dynamodctl list              # List all services with status and boot state
 dynamodctl start <name>      # Start a service
 dynamodctl stop <name>       # Stop a service
 dynamodctl restart <name>    # Restart a service
 dynamodctl status <name>     # Show service details
 dynamodctl tree              # Display the supervisor tree
-dynamodctl shutdown <mode>   # poweroff, reboot, or halt
+dynamodctl reload            # Re-read /usr/lib/dynamod and /etc/dynamod
+dynamodctl enable|disable [--now] <name>...  # Boot markers (no svmgr needed)
+dynamodctl is-enabled <name> # Exit 0 if enabled, 1 if not
+dynamodctl shutdown <mode>   # poweroff, reboot, or halt, now
+dynamodctl reboot|poweroff|halt [-f]         # As the commands below
 ```
+
+`--root DIR` (or `$DYNAMOD_ROOT`) prefixes the configuration paths, the
+markers and the control socket, for image building and tests.
+
+dynamodctl is also a multi-call binary, dispatching on its program name
+(`tools/install.sh` creates the links):
+
+| Name | Behaviour |
+|------|-----------|
+| `reboot`, `poweroff`, `halt` | Clean shutdown through svmgr. `-f`/`--force` (root only): `sync` and `reboot(2)` at once, nothing stopped (`-n`: no sync). `-p`, `--reboot`, `--halt` change the kind; `-w` does nothing (no wtmp); `--no-wall` |
+| `shutdown [-r\|-h\|-P\|-H] [TIME] [MSG]` | TIME is `now`, `+M` (or `M`), `HH:MM` (next local time), default `+1`. `now` shuts down at once; later times are kept by svmgr (`ScheduleShutdown`) and run the same clean path when due. `-c` cancels, `-k` only warns. Wall messages go to every terminal that accepts them (`mesg y`) |
+| `systemctl` | A small front end, not systemd (`--version` says so): `start`, `stop`, `restart`, `reload-or-restart` (= restart), `try-restart`, `status` (exit 3 inactive, 4 unknown), `show [-p PROP] [--value]`, `is-active` (0/3), `is-failed`, `is-enabled`, `enable`/`disable [--now]`, `list-units [--all] [--state=]`, `list-unit-files`, `daemon-reload`, `reboot`/`poweroff`/`halt [-f]`. `NAME.service` is `NAME`; other unit types and unknown verbs are errors (exit 1); starting an unknown service exits 5. `-q`, `--no-pager`, `--no-block` and similar are accepted; start/stop never wait for the job anyway |
 
 ### dynamod-logd (Rust)
 
@@ -184,15 +208,20 @@ Packaging helper: `tools/mkiso.sh` builds `dynamod-live.iso` with volume id **DY
 
 ### Phase C: Service startup (in dynamod-svmgr)
 
-1. Load all `*.toml` from `/etc/dynamod/services/` and `/etc/dynamod/supervisors/`
+1. Load all `*.toml` from `/usr/lib/dynamod/{services,supervisors}/`, then
+   `/etc/dynamod/{services,supervisors}/` (by file name: `/etc` replaces,
+   a `/dev/null` symlink or empty file masks)
 2. Validate configs (no cycles, cross-references check)
 3. Initialize cgroup v2 hierarchy at `/sys/fs/cgroup/dynamod/`
 4. Bind control socket at `/run/dynamod/control.sock`
-5. Build dependency graph, compute initial frontier
+5. Compute the boot set: enabled services plus, transitively, what they
+   `requires` or `wants`; build its dependency graph and initial frontier
 6. Start all services with zero unmet dependencies in parallel
 7. As services become ready, decrement unmet counts for dependents
-8. If a service fails, block all transitive `requires` dependents
-9. Log startup summary: "N ready, M blocked"
+8. If a service fails, block all transitive `requires` dependents, and
+   perform its `failure-action`, if any
+9. Once the frontier has settled, start the `after-all` services
+10. Log startup summary: "N ready, M blocked, K not started (disabled)"
 
 Typical boot on a disk-based system:
 
@@ -203,11 +232,19 @@ fsck → remount-root-rw → fstab-mount → (bootmisc, hostname, sysctl, networ
 
 ## Shutdown sequence
 
-1. Svmgr computes reverse topological order (dependents stop first)
-2. For each service: run `stop-exec` if configured, else send `stop-signal`
-   (default SIGTERM), wait `stop-timeout` (default 10s), SIGKILL if still alive
+`reboot`, `poweroff`, `halt`, `shutdown`, `systemctl reboot`, logind and
+failure actions all send `Shutdown` over the control socket (a due scheduled
+shutdown does the same internally):
+
+1. Svmgr computes reverse topological order (dependents stop first), then
+   moves the `last` services to the end
+2. For each service: run `stop-exec` if configured (bounded by
+   `stop-timeout`), then send `stop-signal` (default SIGTERM), wait
+   `stop-timeout` (default 10s), SIGKILL if still alive. An active
+   `remain-after-exit` oneshot only runs its `stop-exec`
 3. Clean up cgroup for each stopped service
-4. Svmgr sends `RequestShutdown` to init, then exits
+4. Svmgr sends `RequestShutdown` to init and waits to be killed by it (so
+   that init cannot see svmgr exit before reading the request)
 5. Init sends SIGTERM to all remaining processes, waits 5s reaping zombies
 6. Init sends SIGKILL to remaining processes, waits 2s
 7. Save random seed to `/var/lib/dynamod/random-seed`
@@ -216,6 +253,14 @@ fsck → remount-root-rw → fstab-mount → (bootmisc, hostname, sysctl, networ
    hardcoded list if `/proc/mounts` is unreadable)
 10. Remount `/` read-only
 11. Final `sync()`, then `reboot(2)` syscall (poweroff/reboot/halt)
+
+`reboot -f` and `failure-action = "reboot-force"` skip all of this: `sync()`
+and `reboot(2)` directly from dynamodctl or svmgr.
+
+A SIGTERM/SIGINT/SIGUSR1 sent to dynamod-init takes a shorter path: init
+forwards `ShutdownSignal` to svmgr but starts its own sequence (SIGTERM to
+all, 5s) at once, so stop commands such as a `last` service's `stop-exec`
+may not run. Use the commands above for a shutdown that stops services.
 
 ## IPC protocol
 
@@ -240,7 +285,7 @@ Unix domain sockets (SOCK_STREAM).
 | Channel | Transport | Messages |
 |---------|-----------|----------|
 | init ↔ svmgr | socketpair (pre-fork) | Heartbeat, HeartbeatAck, RequestShutdown, ShutdownSignal, LogToKmsg |
-| svmgr ↔ dynamodctl | `/run/dynamod/control.sock` | StartService, StopService, RestartService, ServiceStatus, ListServices, TreeStatus, Reload, Shutdown, GetServiceByPid |
+| svmgr ↔ dynamodctl | `/run/dynamod/control.sock` | StartService, StopService, RestartService, ServiceStatus, DescribeService, ListServices, TreeStatus, Reload, Shutdown, ScheduleShutdown, CancelShutdown, GetServiceByPid |
 
 ## Supervisor trees
 
@@ -271,6 +316,19 @@ escalates to its parent.
 - **transient**: Restart only on abnormal exit (non-zero code or signal)
 - **temporary**: Never restart (for oneshot tasks)
 
+Whatever the policy, a service stopped on request is not restarted, and a
+oneshot that exited 0 is not run again (a `remain-after-exit` oneshot stays
+"exited", i.e. active, until stopped).
+
+### Failure actions
+
+A service fails for good when it cannot be spawned, a oneshot exits non-zero
+at boot, its readiness check times out or fails, or it exits abnormally and
+is not restarted (policy, or intensity exceeded). Then its `failure-action`
+applies: `reboot`/`poweroff` start the clean shutdown above, `reboot-force`
+calls `reboot(2)` immediately. The request is queued and performed by the
+main loop within ~100ms; a pending `reboot-force` overrides a clean one.
+
 ## Dependency resolution
 
 Services declare ordering and hard/soft dependencies:
@@ -290,7 +348,11 @@ a live frontier of services whose dependencies are all satisfied:
 3. When a service becomes READY: decrement `unmet` for all its dependents;
    if any reach zero, add them to the frontier
 4. When a service FAILS: block all transitive `requires` dependents;
-   `after`-only dependents can still start
+   `wants`/`after`-only dependents of the failed or blocked services can
+   still start
+5. `after-all` services whose own dependencies are met are held until the
+   frontier has settled (nothing else waiting to start or to become ready,
+   apart from services that wait for an `after-all` service)
 
 This maximizes parallelism. In a diamond dependency (A → B, A → C, B+C → D),
 B and C start simultaneously after A is ready.

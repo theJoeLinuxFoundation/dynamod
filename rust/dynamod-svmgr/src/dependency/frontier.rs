@@ -9,6 +9,11 @@
 /// 2. Frontier = { s : unmet[s] == 0 }
 /// 3. When service becomes READY: decrement unmet for all dependents
 /// 4. When service FAILS: block all transitive dependents via `requires`
+///
+/// `after-all` services are held back even when their own dependencies are
+/// met, until the frontier has settled: no other service is waiting to start
+/// or started-but-not-ready. Services that wait on an after-all service do
+/// not count (they cannot progress before it).
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use super::graph::DependencyGraph;
@@ -28,29 +33,88 @@ pub struct StartupFrontier {
     blocked: HashSet<String>,
     /// Services that have been completed (started and ready, or failed).
     completed: HashSet<String>,
+    /// Services with `after-all = true`.
+    after_all: HashSet<String>,
+    /// After-all services whose dependencies are met, waiting for the rest
+    /// of the boot to settle.
+    held: Vec<String>,
 }
 
 impl StartupFrontier {
     /// Initialize the frontier from a dependency graph.
     pub fn new(graph: &DependencyGraph) -> Self {
-        let mut unmet = HashMap::new();
-        let mut ready_to_start = VecDeque::new();
+        Self::with_after_all(graph, HashSet::new())
+    }
 
-        for service in graph.all_services() {
-            let count = graph.dependencies_of(service).len();
-            unmet.insert(service.clone(), count);
-            if count == 0 {
-                ready_to_start.push_back(service.clone());
-            }
-        }
-
-        Self {
-            unmet,
-            ready_to_start,
+    /// Initialize the frontier; the services in `after_all` start only once
+    /// everything else has settled.
+    pub fn with_after_all(graph: &DependencyGraph, after_all: HashSet<String>) -> Self {
+        let mut frontier = Self {
+            unmet: HashMap::new(),
+            ready_to_start: VecDeque::new(),
             ready: HashSet::new(),
             pending: HashSet::new(),
             blocked: HashSet::new(),
             completed: HashSet::new(),
+            after_all,
+            held: Vec::new(),
+        };
+
+        let mut services: Vec<&String> = graph.all_services().iter().collect();
+        services.sort();
+        for service in services {
+            let count = graph.dependencies_of(service).len();
+            frontier.unmet.insert(service.clone(), count);
+            if count == 0 {
+                frontier.enqueue(service.clone());
+            }
+        }
+        frontier.release_held_if_settled();
+        frontier
+    }
+
+    /// A service whose dependencies are all met: start it, or hold it if it
+    /// is an after-all service.
+    fn enqueue(&mut self, service: String) {
+        if self.after_all.contains(&service) {
+            if !self.held.contains(&service) {
+                self.held.push(service);
+            }
+        } else {
+            self.ready_to_start.push_back(service);
+        }
+    }
+
+    /// Whether nothing but after-all services is waiting to start or to
+    /// become ready.
+    pub fn is_settled(&self) -> bool {
+        !self
+            .ready_to_start
+            .iter()
+            .any(|s| !self.after_all.contains(s))
+            && !self.pending.iter().any(|s| !self.after_all.contains(s))
+    }
+
+    fn release_held_if_settled(&mut self) {
+        if !self.held.is_empty() && self.is_settled() {
+            let held = std::mem::take(&mut self.held);
+            self.ready_to_start.extend(held);
+        }
+    }
+
+    /// Decrement the unmet count of `dependent`, enqueueing it at zero.
+    fn dependency_done(&mut self, dependent: &str) {
+        if self.blocked.contains(dependent) {
+            return;
+        }
+        if let Some(count) = self.unmet.get_mut(dependent) {
+            *count = count.saturating_sub(1);
+            if *count == 0
+                && !self.completed.contains(dependent)
+                && !self.pending.contains(dependent)
+            {
+                self.enqueue(dependent.to_string());
+            }
         }
     }
 
@@ -74,16 +138,9 @@ impl StartupFrontier {
 
         // Decrement unmet count for all dependents
         for dependent in graph.dependents_of(service) {
-            if self.blocked.contains(dependent) {
-                continue;
-            }
-            if let Some(count) = self.unmet.get_mut(dependent) {
-                *count = count.saturating_sub(1);
-                if *count == 0 && !self.completed.contains(dependent) && !self.pending.contains(dependent) {
-                    self.ready_to_start.push_back(dependent.clone());
-                }
-            }
+            self.dependency_done(dependent);
         }
+        self.release_held_if_settled();
     }
 
     /// Mark a service as FAILED.
@@ -95,22 +152,13 @@ impl StartupFrontier {
 
         // Block all services that require this one (transitively)
         let mut to_block = VecDeque::new();
+        let mut soft_done = Vec::new();
         for dependent in graph.dependents_of(service) {
             // Only block if this is a hard (requires) dependency
             if graph.requires_of(dependent).contains(service) {
                 to_block.push_back(dependent.clone());
             } else {
-                // Soft dependency: just decrement unmet and potentially unblock
-                if let Some(count) = self.unmet.get_mut(dependent) {
-                    *count = count.saturating_sub(1);
-                    if *count == 0
-                        && !self.completed.contains(dependent)
-                        && !self.pending.contains(dependent)
-                        && !self.blocked.contains(dependent)
-                    {
-                        self.ready_to_start.push_back(dependent.clone());
-                    }
-                }
+                soft_done.push(dependent.clone());
             }
         }
 
@@ -121,14 +169,27 @@ impl StartupFrontier {
             }
             self.blocked.insert(svc.clone());
             self.completed.insert(svc.clone());
+            self.ready_to_start.retain(|s| s != &svc);
+            self.held.retain(|s| s != &svc);
 
-            // Also block anything that requires this newly-blocked service
+            // Block anything that requires this newly-blocked service; for
+            // `wants`/`after` dependents, the blocked service is done.
             for dep in graph.dependents_of(&svc) {
-                if graph.requires_of(dep).contains(&svc) && !self.blocked.contains(dep) {
-                    to_block.push_back(dep.clone());
+                if graph.requires_of(dep).contains(&svc) {
+                    if !self.blocked.contains(dep) {
+                        to_block.push_back(dep.clone());
+                    }
+                } else {
+                    soft_done.push(dep.clone());
                 }
             }
         }
+
+        // Soft dependents: the failed or blocked dependency counts as done.
+        for dependent in soft_done {
+            self.dependency_done(&dependent);
+        }
+        self.release_held_if_settled();
     }
 
     /// Check if all services have been processed.
@@ -326,5 +387,114 @@ after = {after}
         frontier.mark_ready("b", &graph);
         let batch = frontier.take_ready();
         assert_eq!(batch, vec!["d"]);
+    }
+
+    fn make_after_all(name: &str, requires: &[&str]) -> ServiceDef {
+        let mut def = make_service(name, requires, &[]);
+        def.dependencies.after_all = true;
+        def
+    }
+
+    fn sorted(mut v: Vec<String>) -> Vec<String> {
+        v.sort();
+        v
+    }
+
+    fn frontier_for(defs: &[ServiceDef]) -> (DependencyGraph, StartupFrontier) {
+        let graph = DependencyGraph::build(defs);
+        let after_all = defs
+            .iter()
+            .filter(|d| d.dependencies.after_all)
+            .map(|d| d.service.name.clone())
+            .collect();
+        let frontier = StartupFrontier::with_after_all(&graph, after_all);
+        (graph, frontier)
+    }
+
+    #[test]
+    fn test_after_all_waits_for_every_other_service() {
+        let defs = vec![
+            make_service("a", &[], &[]),
+            make_service("b", &["a"], &[]),
+            make_service("c", &[], &[]),
+            make_after_all("check", &[]),
+        ];
+        let (graph, mut f) = frontier_for(&defs);
+
+        // "check" has no dependencies but is held back.
+        assert_eq!(sorted(f.take_ready()), vec!["a", "c"]);
+        f.mark_ready("c", &graph);
+        assert!(f.take_ready().is_empty());
+        f.mark_ready("a", &graph);
+        assert_eq!(f.take_ready(), vec!["b"], "b still runs before check");
+        f.mark_ready("b", &graph);
+        assert_eq!(f.take_ready(), vec!["check"]);
+    }
+
+    #[test]
+    fn test_after_all_counts_failed_and_blocked_as_settled() {
+        let defs = vec![
+            make_service("a", &[], &[]),
+            make_service("b", &["a"], &[]),
+            make_service("c", &[], &[]),
+            make_after_all("check", &[]),
+        ];
+        let (graph, mut f) = frontier_for(&defs);
+        assert_eq!(sorted(f.take_ready()), vec!["a", "c"]);
+        f.mark_failed("a", &graph); // blocks b
+        assert!(f.blocked_services().contains("b"));
+        assert!(f.take_ready().is_empty(), "c is still pending");
+        f.mark_ready("c", &graph);
+        assert_eq!(f.take_ready(), vec!["check"]);
+    }
+
+    #[test]
+    fn test_after_all_ignores_services_that_wait_for_it() {
+        // "report" runs after the check; it must not hold the check back.
+        let defs = vec![
+            make_service("a", &[], &[]),
+            make_after_all("check", &[]),
+            make_service("report", &[], &["check"]),
+        ];
+        let (graph, mut f) = frontier_for(&defs);
+        assert_eq!(f.take_ready(), vec!["a"]);
+        f.mark_ready("a", &graph);
+        assert_eq!(f.take_ready(), vec!["check"]);
+        f.mark_ready("check", &graph);
+        assert_eq!(f.take_ready(), vec!["report"]);
+    }
+
+    #[test]
+    fn test_after_all_alone_starts_immediately() {
+        let defs = vec![make_after_all("check", &[])];
+        let (_graph, mut f) = frontier_for(&defs);
+        assert_eq!(f.take_ready(), vec!["check"]);
+    }
+
+    #[test]
+    fn test_after_all_still_honours_its_own_requires() {
+        let defs = vec![make_service("a", &[], &[]), make_after_all("check", &["a"])];
+        let (graph, mut f) = frontier_for(&defs);
+        assert_eq!(f.take_ready(), vec!["a"]);
+        f.mark_failed("a", &graph);
+        assert!(f.blocked_services().contains("check"));
+        assert!(f.take_ready().is_empty());
+        assert!(!f.has_ready());
+    }
+
+    #[test]
+    fn test_soft_dependent_of_blocked_service_still_starts() {
+        // b requires a; c is only `after` b. a fails -> b blocked -> c starts.
+        let defs = vec![
+            make_service("a", &[], &[]),
+            make_service("b", &["a"], &[]),
+            make_service("c", &[], &["b"]),
+        ];
+        let graph = DependencyGraph::build(&defs);
+        let mut f = StartupFrontier::new(&graph);
+        assert_eq!(f.take_ready(), vec!["a"]);
+        f.mark_failed("a", &graph);
+        assert!(f.blocked_services().contains("b"));
+        assert_eq!(f.take_ready(), vec!["c"]);
     }
 }

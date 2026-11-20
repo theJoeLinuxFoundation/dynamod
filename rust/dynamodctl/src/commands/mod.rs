@@ -2,49 +2,19 @@
 ///
 /// Each command connects to the control socket, sends a request,
 /// and prints the response.
-use std::io::{Read, Write};
-use std::os::unix::net::UnixStream;
+use dynamod_common::protocol::{MessageBody, ShutdownKind};
 
-use dynamod_common::protocol::{
-    self, DecodeError, Message, MessageBody, MessageKind, ShutdownKind,
-};
+use crate::client::send_request;
 
 type Result = std::result::Result<(), Box<dyn std::error::Error>>;
 
-/// Send a request to the control socket and return the response body.
-fn send_request(socket_path: &str, body: MessageBody) -> std::result::Result<MessageBody, Box<dyn std::error::Error>> {
-    let mut stream = UnixStream::connect(socket_path)
-        .map_err(|e| format!("cannot connect to {socket_path}: {e}"))?;
-
-    stream.set_read_timeout(Some(std::time::Duration::from_secs(10)))?;
-
-    let msg = Message {
-        id: 1,
-        kind: MessageKind::Request,
-        body,
-    };
-
-    let data = protocol::encode(&msg)?;
-    stream.write_all(&data)?;
-
-    let mut buf = vec![0u8; protocol::HEADER_SIZE + protocol::MAX_MESSAGE_SIZE as usize];
-    let mut filled: usize = 0;
-    loop {
-        let n = stream.read(&mut buf[filled..])?;
-        if n == 0 {
-            return Err("connection closed before complete message".into());
-        }
-        filled += n;
-        match protocol::decode(&buf[..filled]) {
-            Ok((resp, _consumed)) => return Ok(resp.body),
-            Err(DecodeError::Incomplete) => continue,
-            Err(e) => return Err(e.into()),
-        }
-    }
-}
-
 pub fn start(socket_path: &str, name: &str) -> Result {
-    match send_request(socket_path, MessageBody::StartService { name: name.to_string() })? {
+    match send_request(
+        socket_path,
+        MessageBody::StartService {
+            name: name.to_string(),
+        },
+    )? {
         MessageBody::Ack => {
             println!("Starting service '{name}'...");
             Ok(())
@@ -55,7 +25,12 @@ pub fn start(socket_path: &str, name: &str) -> Result {
 }
 
 pub fn stop(socket_path: &str, name: &str) -> Result {
-    match send_request(socket_path, MessageBody::StopService { name: name.to_string() })? {
+    match send_request(
+        socket_path,
+        MessageBody::StopService {
+            name: name.to_string(),
+        },
+    )? {
         MessageBody::Ack => {
             println!("Stopping service '{name}'...");
             Ok(())
@@ -66,7 +41,12 @@ pub fn stop(socket_path: &str, name: &str) -> Result {
 }
 
 pub fn restart(socket_path: &str, name: &str) -> Result {
-    match send_request(socket_path, MessageBody::RestartService { name: name.to_string() })? {
+    match send_request(
+        socket_path,
+        MessageBody::RestartService {
+            name: name.to_string(),
+        },
+    )? {
         MessageBody::Ack => {
             println!("Restarting service '{name}'...");
             Ok(())
@@ -77,8 +57,68 @@ pub fn restart(socket_path: &str, name: &str) -> Result {
 }
 
 pub fn status(socket_path: &str, name: &str) -> Result {
-    match send_request(socket_path, MessageBody::ServiceStatus { name: name.to_string() })? {
-        MessageBody::ServiceInfo { name, status, pid, supervisor } => {
+    match send_request(
+        socket_path,
+        MessageBody::DescribeService {
+            name: name.to_string(),
+        },
+    )? {
+        MessageBody::ServiceDetails(d) => {
+            println!("Service: {}", d.name);
+            println!("  Status:     {}", d.status);
+            if let Some(p) = d.pid {
+                println!("  PID:        {p}");
+            }
+            println!("  Supervisor: {}", d.supervisor);
+            println!(
+                "  Boot:       {} ({})",
+                if d.enabled { "enabled" } else { "disabled" },
+                d.enabled_source
+            );
+            println!("  Type:       {}", d.service_type);
+            if let Some(ref src) = d.source {
+                println!("  Definition: {src}");
+            }
+            let mut options = Vec::new();
+            if d.remain_after_exit {
+                options.push("remain-after-exit".to_string());
+            }
+            if d.after_all {
+                options.push("after-all".to_string());
+            }
+            if d.last {
+                options.push("last".to_string());
+            }
+            if d.failure_action != "none" {
+                options.push(format!("failure-action={}", d.failure_action));
+            }
+            if !options.is_empty() {
+                println!("  Options:    {}", options.join(", "));
+            }
+            Ok(())
+        }
+        // An svmgr without DescribeService
+        MessageBody::Error { message } if message == "unknown command" => {
+            status_basic(socket_path, name)
+        }
+        MessageBody::Error { message } => Err(message.into()),
+        _ => Err("unexpected response".into()),
+    }
+}
+
+fn status_basic(socket_path: &str, name: &str) -> Result {
+    match send_request(
+        socket_path,
+        MessageBody::ServiceStatus {
+            name: name.to_string(),
+        },
+    )? {
+        MessageBody::ServiceInfo {
+            name,
+            status,
+            pid,
+            supervisor,
+        } => {
             println!("Service: {name}");
             println!("  Status:     {status}");
             if let Some(p) = pid {
@@ -101,15 +141,26 @@ pub fn list(socket_path: &str) -> Result {
             }
 
             // Print table header
-            println!("{:<30} {:<15} {:<10}", "SERVICE", "STATUS", "PID");
-            println!("{}", "-".repeat(55));
+            println!(
+                "{:<30} {:<15} {:<10} {:<8}",
+                "SERVICE", "STATUS", "PID", "BOOT"
+            );
+            println!("{}", "-".repeat(64));
 
             let mut services = services;
             services.sort_by(|a, b| a.name.cmp(&b.name));
 
             for svc in &services {
                 let pid_str = svc.pid.map(|p| p.to_string()).unwrap_or_else(|| "-".into());
-                println!("{:<30} {:<15} {:<10}", svc.name, svc.status, pid_str);
+                let boot = match svc.enabled {
+                    Some(true) => "enabled",
+                    Some(false) => "disabled",
+                    None => "-",
+                };
+                println!(
+                    "{:<30} {:<15} {:<10} {:<8}",
+                    svc.name, svc.status, pid_str, boot
+                );
             }
 
             println!("\n{} service(s) total", services.len());
@@ -142,15 +193,25 @@ pub fn reload(socket_path: &str) -> Result {
     }
 }
 
+/// `dynamodctl shutdown [poweroff|reboot|halt]`: immediate clean shutdown.
 pub fn shutdown(socket_path: &str, kind: &str) -> Result {
     let shutdown_kind = match kind {
         "poweroff" | "off" => ShutdownKind::Poweroff,
         "reboot" => ShutdownKind::Reboot,
         "halt" => ShutdownKind::Halt,
-        _ => return Err(format!("unknown shutdown kind: {kind} (use poweroff, reboot, or halt)").into()),
+        _ => {
+            return Err(
+                format!("unknown shutdown kind: {kind} (use poweroff, reboot, or halt)").into(),
+            );
+        }
     };
 
-    match send_request(socket_path, MessageBody::Shutdown { kind: shutdown_kind })? {
+    match send_request(
+        socket_path,
+        MessageBody::Shutdown {
+            kind: shutdown_kind,
+        },
+    )? {
         MessageBody::Ack => {
             println!("System {kind} initiated.");
             Ok(())

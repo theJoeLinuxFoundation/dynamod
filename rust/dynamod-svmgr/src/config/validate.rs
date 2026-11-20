@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 
-use super::service::{ReadinessType, ServiceDef};
+use super::service::{ReadinessType, ServiceDef, ServiceType};
 use super::supervisor::SupervisorDef;
 
 /// Validation errors for service and supervisor configurations.
@@ -20,6 +20,8 @@ pub enum ValidationError {
     DuplicateService(String),
     #[error("duplicate supervisor name: '{0}'")]
     DuplicateSupervisor(String),
+    #[error("service '{0}': remain-after-exit only applies to type = \"oneshot\" (ignored)")]
+    RemainAfterExitNotOneshot(String),
 }
 
 /// Validate a single service definition.
@@ -37,6 +39,10 @@ pub fn validate_service(def: &ServiceDef) -> Vec<ValidationError> {
 
     if def.readiness.readiness_type == ReadinessType::Exec && def.readiness.check_exec.is_none() {
         errors.push(ValidationError::MissingCheckExec(name.clone()));
+    }
+
+    if def.service.remain_after_exit && def.service.service_type != ServiceType::Oneshot {
+        errors.push(ValidationError::RemainAfterExitNotOneshot(name.clone()));
     }
 
     errors
@@ -71,8 +77,8 @@ pub fn validate_all(
         errors.extend(validate_service(svc));
 
         // Check supervisor reference ("root" is always valid even without root.toml)
-        let sup_ok = svc.service.supervisor == "root"
-            || supervisor_names.contains(&svc.service.supervisor);
+        let sup_ok =
+            svc.service.supervisor == "root" || supervisor_names.contains(&svc.service.supervisor);
         if !sup_ok {
             errors.push(ValidationError::UnknownSupervisor(
                 svc.service.name.clone(),
@@ -107,6 +113,10 @@ exec = []
 "#;
         let def: ServiceDef = toml::from_str(toml_str).unwrap();
         let errors = validate_service(&def);
-        assert!(errors.iter().any(|e| matches!(e, ValidationError::EmptyExec(_))));
+        assert!(
+            errors
+                .iter()
+                .any(|e| matches!(e, ValidationError::EmptyExec(_)))
+        );
     }
 }

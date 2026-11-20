@@ -1,6 +1,4 @@
 /// dynamod-svmgr: Service manager for the dynamod init system.
-///
-/// Phase 7: Graceful shutdown + hardening.
 mod cgroup;
 mod config;
 mod dependency;
@@ -9,21 +7,41 @@ mod namespace;
 mod process;
 mod shutdown;
 mod supervisor;
+mod system_action;
 
-use std::path::Path;
-use std::time::{Duration, Instant};
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use config::service::{self, parse_duration_secs, ServiceType};
+use config::service::{self, ServiceDef, ServiceType, parse_duration_secs};
 use config::supervisor as sup_config;
 use config::validate;
+use dependency::graph::DependencyGraph;
 use ipc::init_channel::InitChannel;
 use process::spawn;
 use supervisor::intensity::RestartIntensity;
 use supervisor::lifecycle::{ExitInfo, ServiceState};
 use supervisor::strategy;
 use supervisor::tree::{SupervisorTree, TreeNode};
+use system_action::SystemAction;
 
-use dynamod_common::protocol::MessageBody;
+use dynamod_common::config_dirs;
+use dynamod_common::paths;
+use dynamod_common::protocol::{MessageBody, ShutdownKind};
+
+type CgroupHierarchy = Option<cgroup::hierarchy::CgroupHierarchy>;
+type CgroupMonitor = cgroup::monitor::CgroupMonitor;
+
+/// State shared by the main loops and the control actions, besides the tree.
+struct Runtime {
+    /// Alternative root for configuration and markers ($DYNAMOD_ROOT).
+    root: Option<PathBuf>,
+    /// Dependency graph of every loaded service (used for shutdown order).
+    dep_graph: DependencyGraph,
+    /// Shutdown scheduled by `shutdown +M` / `shutdown HH:MM`: kind and
+    /// wall-clock time (seconds since the epoch).
+    scheduled_shutdown: Option<(ShutdownKind, u64)>,
+}
 
 fn main() {
     tracing_subscriber::fmt()
@@ -45,20 +63,20 @@ fn main() {
         let _ = ch.send_heartbeat();
     }
 
-    // Load configuration
-    let services_dir = Path::new(dynamod_common::paths::SERVICES_DIR);
-    let supervisors_dir = Path::new(dynamod_common::paths::SUPERVISORS_DIR);
+    let root = paths::root_from_env();
+    if let Some(ref r) = root {
+        tracing::warn!(
+            "using alternative root {} (${})",
+            r.display(),
+            paths::ROOT_ENV
+        );
+    }
 
-    let services = service::load_services_dir(services_dir).unwrap_or_else(|e| {
-        tracing::warn!("failed to load services: {e}");
-        Vec::new()
-    });
+    // Load configuration: /usr/lib/dynamod/... then /etc/dynamod/...
+    let services = service::load_services(&paths::service_dirs(root.as_deref()));
     tracing::info!("loaded {} service definition(s)", services.len());
 
-    let supervisor_defs = sup_config::load_supervisors_dir(supervisors_dir).unwrap_or_else(|e| {
-        tracing::warn!("failed to load supervisors: {e}");
-        Vec::new()
-    });
+    let supervisor_defs = sup_config::load_supervisors(&paths::supervisor_dirs(root.as_deref()));
     tracing::info!("loaded {} supervisor definition(s)", supervisor_defs.len());
 
     let errors = validate::validate_all(&services, &supervisor_defs);
@@ -87,7 +105,8 @@ fn main() {
 
     // Start control socket server
     let control_server = match ipc::control::ControlServer::bind(
-        Path::new(dynamod_common::paths::CONTROL_SOCK),
+        &paths::rooted(root.as_deref(), paths::CONTROL_SOCK),
+        root.clone(),
     ) {
         Ok(s) => Some(s),
         Err(e) => {
@@ -110,108 +129,139 @@ fn main() {
             // Update root's strategy from config
             if let Some(TreeNode::Supervisor(root)) = tree.get_mut("root") {
                 root.strategy = sup_def.supervisor.strategy.clone();
-                let window = parse_duration_secs(&sup_def.restart.max_restart_window)
-                    .unwrap_or(600);
-                root.intensity =
-                    RestartIntensity::new(sup_def.restart.max_restarts, Duration::from_secs(window));
+                let window =
+                    parse_duration_secs(&sup_def.restart.max_restart_window).unwrap_or(600);
+                root.intensity = RestartIntensity::new(
+                    sup_def.restart.max_restarts,
+                    Duration::from_secs(window),
+                );
             }
             continue;
         }
-
-        let parent = sup_def
-            .supervisor
-            .parent
-            .as_deref()
-            .unwrap_or("root");
-        let window =
-            parse_duration_secs(&sup_def.restart.max_restart_window).unwrap_or(300);
-        let intensity =
-            RestartIntensity::new(sup_def.restart.max_restarts, Duration::from_secs(window));
-
-        if let Err(e) = tree.add_supervisor(
-            &sup_def.supervisor.name,
-            parent,
-            sup_def.supervisor.strategy.clone(),
-            intensity,
-        ) {
-            tracing::error!("failed to add supervisor '{}': {e}", sup_def.supervisor.name);
-        }
+        add_supervisor(&mut tree, sup_def);
     }
 
-    // Add workers (services) to the tree
-    for def in &services {
-        let parent = &def.service.supervisor;
-        // Ensure the parent supervisor exists; if not, fall back to root
-        let parent_id = if tree.get(parent).is_some() {
-            parent.as_str()
-        } else {
-            tracing::warn!(
-                "service '{}' references unknown supervisor '{}', using root",
-                def.service.name,
-                parent
-            );
-            "root"
-        };
-
-        if let Err(e) = tree.add_worker(def.clone(), parent_id) {
-            tracing::error!("failed to add service '{}' to tree: {e}", def.service.name);
+    // Add workers (services) to the tree; keep the ones that made it
+    let mut loaded: Vec<ServiceDef> = Vec::with_capacity(services.len());
+    for def in services {
+        if add_worker(&mut tree, &def) {
+            loaded.push(def);
         }
     }
+    let services = loaded;
 
     // Build dependency graph and validate no cycles
-    let dep_graph = dependency::graph::DependencyGraph::build(&services);
+    let dep_graph = DependencyGraph::build(&services);
     if let Err(e) = dependency::cycle::validate_no_cycles(&dep_graph) {
         tracing::error!("FATAL: {e}");
         tracing::error!("refusing to boot with cyclic dependencies");
         std::process::exit(1);
     }
 
+    // The services to start at boot: enabled ones and what they require/want
+    let boot = dependency::boot::boot_set(&services, |d| {
+        config_dirs::enablement(root.as_deref(), &d.service.name, d.service.enabled).enabled
+    });
+    let boot_defs: Vec<ServiceDef> = services
+        .iter()
+        .filter(|d| boot.contains(&d.service.name))
+        .cloned()
+        .collect();
+    let boot_graph = DependencyGraph::build(&boot_defs);
+    let after_all: HashSet<String> = boot_defs
+        .iter()
+        .filter(|d| d.dependencies.after_all)
+        .map(|d| d.service.name.clone())
+        .collect();
+    tracing::info!(
+        "{} of {} service(s) to start at boot ({} disabled)",
+        boot.len(),
+        services.len(),
+        services.len() - boot.len()
+    );
+
+    let mut rt = Runtime {
+        root,
+        dep_graph,
+        scheduled_shutdown: None,
+    };
+
     // Start services using the dynamic frontier algorithm
-    let mut frontier = dependency::frontier::StartupFrontier::new(&dep_graph);
-    let mut readiness_trackers: std::collections::HashMap<String, process::readiness::ReadinessTracker> =
-        std::collections::HashMap::new();
+    let mut frontier =
+        dependency::frontier::StartupFrontier::with_after_all(&boot_graph, after_all);
+    let mut readiness_trackers: HashMap<String, process::readiness::ReadinessTracker> =
+        HashMap::new();
     // Oneshot services waiting for process exit before being marked ready
-    let mut pending_oneshots: std::collections::HashSet<String> =
-        std::collections::HashSet::new();
+    let mut pending_oneshots: HashSet<String> = HashSet::new();
 
     tracing::info!("starting services via dependency frontier");
 
     // Process the frontier until all services are started
     loop {
+        perform_pending_system_actions(
+            &mut tree,
+            &mut rt,
+            &cgroup_hierarchy,
+            &mut cgroup_monitor,
+            &mut init_channel,
+        );
 
         // Reap exited children during startup (handles oneshot completion)
         reap_oneshots_during_startup(
-            &mut tree, &mut pending_oneshots, &mut frontier,
-            &dep_graph, &cgroup_hierarchy, &mut cgroup_monitor,
+            &mut tree,
+            &mut pending_oneshots,
+            &mut frontier,
+            &boot_graph,
+            &cgroup_hierarchy,
+            &mut cgroup_monitor,
         );
+        settle_lost_oneshots(&tree, &mut pending_oneshots, &mut frontier, &boot_graph);
 
         // Start any services whose dependencies are satisfied
         let batch = frontier.take_ready();
         for name in &batch {
+            // Started explicitly while it was waiting for its dependencies?
+            if tree
+                .get_worker(name)
+                .is_some_and(|w| w.pid.is_some() || w.state == ServiceState::Exited)
+            {
+                tracing::info!("service '{name}' already started");
+                frontier.mark_ready(name, &boot_graph);
+                continue;
+            }
+
             let ready_fd = start_worker(&mut tree, name, &cgroup_hierarchy, &mut cgroup_monitor);
 
+            let Some(w) = tree.get_worker(name) else {
+                frontier.mark_failed(name, &boot_graph);
+                continue;
+            };
+            if w.pid.is_none() {
+                // Spawning failed
+                frontier.mark_failed(name, &boot_graph);
+                service_failed(&tree, name, "could not be started");
+                continue;
+            }
+
             // Set up readiness tracking
-            if let Some(w) = tree.get_worker(name) {
-                let is_oneshot = w.def.service.service_type == ServiceType::Oneshot;
-                let mut tracker =
-                    process::readiness::ReadinessTracker::new(&w.def.readiness, name);
+            let is_oneshot = w.def.service.service_type == ServiceType::Oneshot;
+            let mut tracker = process::readiness::ReadinessTracker::new(&w.def.readiness, name);
 
-                // Wire in the ready_fd if present
-                if let Some(fd) = ready_fd {
-                    tracker.set_ready_fd(fd);
-                }
+            // Wire in the ready_fd if present
+            if let Some(fd) = ready_fd {
+                tracker.set_ready_fd(fd);
+            }
 
-                if is_oneshot && tracker.is_immediate() {
-                    // Oneshot with no readiness check: wait for process exit
-                    pending_oneshots.insert(name.clone());
-                    tracing::info!("service '{name}' is oneshot, waiting for exit");
-                } else if tracker.is_immediate() {
-                    // Long-running service with no readiness check: ready immediately
-                    frontier.mark_ready(name, &dep_graph);
-                    tracing::info!("service '{name}' ready (immediate)");
-                } else {
-                    readiness_trackers.insert(name.clone(), tracker);
-                }
+            if is_oneshot && tracker.is_immediate() {
+                // Oneshot with no readiness check: wait for process exit
+                pending_oneshots.insert(name.clone());
+                tracing::info!("service '{name}' is oneshot, waiting for exit");
+            } else if tracker.is_immediate() {
+                // Long-running service with no readiness check: ready immediately
+                frontier.mark_ready(name, &boot_graph);
+                tracing::info!("service '{name}' ready (immediate)");
+            } else {
+                readiness_trackers.insert(name.clone(), tracker);
             }
         }
 
@@ -223,17 +273,19 @@ fn main() {
                 process::readiness::ReadinessResult::Ready => {
                     tracing::info!("service '{name}' ready");
                     readiness_trackers.remove(&name);
-                    frontier.mark_ready(&name, &dep_graph);
+                    frontier.mark_ready(&name, &boot_graph);
                 }
                 process::readiness::ReadinessResult::TimedOut => {
                     tracing::error!("service '{name}' readiness timed out");
                     readiness_trackers.remove(&name);
-                    frontier.mark_failed(&name, &dep_graph);
+                    frontier.mark_failed(&name, &boot_graph);
+                    service_failed(&tree, &name, "readiness timed out");
                 }
                 process::readiness::ReadinessResult::Failed(ref msg) => {
                     tracing::error!("service '{name}' readiness failed: {msg}");
                     readiness_trackers.remove(&name);
-                    frontier.mark_failed(&name, &dep_graph);
+                    frontier.mark_failed(&name, &boot_graph);
+                    service_failed(&tree, &name, "readiness check failed");
                 }
                 process::readiness::ReadinessResult::NotReady => {}
             }
@@ -249,10 +301,10 @@ fn main() {
             dispatch_control_actions(
                 server.poll(&tree),
                 &mut tree,
+                &mut rt,
                 &cgroup_hierarchy,
                 &mut cgroup_monitor,
                 &mut init_channel,
-                &dep_graph,
             );
         }
 
@@ -270,9 +322,10 @@ fn main() {
     }
 
     tracing::info!(
-        "startup complete: {} ready, {} blocked",
+        "startup complete: {} ready, {} blocked, {} not started (disabled)",
         frontier.ready_services().len(),
         blocked.len(),
+        services.len() - boot.len(),
     );
 
     // Main event loop
@@ -282,6 +335,14 @@ fn main() {
     const MAX_HEARTBEAT_FAILURES: u32 = 3;
 
     loop {
+        perform_pending_system_actions(
+            &mut tree,
+            &mut rt,
+            &cgroup_hierarchy,
+            &mut cgroup_monitor,
+            &mut init_channel,
+        );
+
         // Reap exited children and apply supervisor strategies
         reap_and_handle_exits(&mut tree, &cgroup_hierarchy, &mut cgroup_monitor);
 
@@ -290,10 +351,10 @@ fn main() {
             dispatch_control_actions(
                 server.poll(&tree),
                 &mut tree,
+                &mut rt,
                 &cgroup_hierarchy,
                 &mut cgroup_monitor,
                 &mut init_channel,
-                &dep_graph,
             );
         }
 
@@ -304,8 +365,10 @@ fn main() {
                     MessageBody::ShutdownSignal { ref signal } => {
                         tracing::info!("shutdown signal from init: {signal}");
                         shutdown::execute_shutdown(
-                            &mut tree, &dep_graph,
-                            &cgroup_hierarchy, &mut cgroup_monitor,
+                            &mut tree,
+                            &rt.dep_graph,
+                            &cgroup_hierarchy,
+                            &mut cgroup_monitor,
                         );
                         std::process::exit(0);
                     }
@@ -320,10 +383,11 @@ fn main() {
         // Poll cgroup events (OOM, memory pressure)
         for event in cgroup_monitor.poll() {
             match event {
-                cgroup::monitor::CgroupEvent::OomKill { ref service_name, count } => {
-                    tracing::error!(
-                        "OOM kill in service '{service_name}' ({count} kill(s))"
-                    );
+                cgroup::monitor::CgroupEvent::OomKill {
+                    ref service_name,
+                    count,
+                } => {
+                    tracing::error!("OOM kill in service '{service_name}' ({count} kill(s))");
                 }
                 cgroup::monitor::CgroupEvent::MemoryHigh {
                     ref service_name,
@@ -360,23 +424,188 @@ fn main() {
     }
 }
 
+/// Add a supervisor from its definition (parent falls back to root).
+fn add_supervisor(tree: &mut SupervisorTree, sup_def: &sup_config::SupervisorDef) -> bool {
+    let parent = sup_def.supervisor.parent.as_deref().unwrap_or("root");
+    let window = parse_duration_secs(&sup_def.restart.max_restart_window).unwrap_or(300);
+    let intensity =
+        RestartIntensity::new(sup_def.restart.max_restarts, Duration::from_secs(window));
+
+    match tree.add_supervisor(
+        &sup_def.supervisor.name,
+        parent,
+        sup_def.supervisor.strategy.clone(),
+        intensity,
+    ) {
+        Ok(()) => true,
+        Err(e) => {
+            tracing::error!(
+                "failed to add supervisor '{}': {e}",
+                sup_def.supervisor.name
+            );
+            false
+        }
+    }
+}
+
+/// Add a service to the tree under its supervisor (or root if unknown).
+fn add_worker(tree: &mut SupervisorTree, def: &ServiceDef) -> bool {
+    let parent = &def.service.supervisor;
+    let parent_id = if tree.get_supervisor(parent).is_some() {
+        parent.as_str()
+    } else {
+        tracing::warn!(
+            "service '{}' references unknown supervisor '{}', using root",
+            def.service.name,
+            parent
+        );
+        "root"
+    };
+
+    match tree.add_worker(def.clone(), parent_id) {
+        Ok(()) => true,
+        Err(e) => {
+            tracing::error!("failed to add service '{}' to tree: {e}", def.service.name);
+            false
+        }
+    }
+}
+
+/// All service definitions currently in the tree.
+fn tree_defs(tree: &SupervisorTree) -> Vec<ServiceDef> {
+    tree.all_workers()
+        .iter()
+        .filter_map(|name| tree.get_worker(name))
+        .map(|w| w.def.clone())
+        .collect()
+}
+
+fn now_unix() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// A service has failed for good: queue its failure-action, if any.
+fn service_failed(tree: &SupervisorTree, name: &str, reason: &str) {
+    if let Some(w) = tree.get_worker(name) {
+        system_action::service_failed(name, reason, w.def.service.failure_action);
+    }
+}
+
+/// Perform a failure-action queued by a failing service, or a scheduled
+/// shutdown that is due. Does not return if either happens.
+fn perform_pending_system_actions(
+    tree: &mut SupervisorTree,
+    rt: &mut Runtime,
+    cgroup_hierarchy: &CgroupHierarchy,
+    cgroup_monitor: &mut CgroupMonitor,
+    init_channel: &mut Option<InitChannel>,
+) {
+    if let Some((action, reason)) = system_action::take() {
+        match action {
+            SystemAction::ForceReboot => {
+                tracing::error!("{reason}: rebooting immediately (reboot-force)");
+                let err = dynamod_common::power::reboot_now(ShutdownKind::Reboot, true);
+                tracing::error!("reboot(2) failed: {err}; falling back to a clean reboot");
+                perform_shutdown(
+                    ShutdownKind::Reboot,
+                    tree,
+                    rt,
+                    cgroup_hierarchy,
+                    cgroup_monitor,
+                    init_channel,
+                );
+            }
+            SystemAction::Shutdown(kind) => {
+                tracing::error!("{reason}: starting {kind:?}");
+                perform_shutdown(
+                    kind,
+                    tree,
+                    rt,
+                    cgroup_hierarchy,
+                    cgroup_monitor,
+                    init_channel,
+                );
+            }
+        }
+    }
+
+    if let Some((kind, at)) = rt.scheduled_shutdown {
+        if now_unix() >= at {
+            tracing::info!("scheduled {kind:?} is due");
+            rt.scheduled_shutdown = None;
+            perform_shutdown(
+                kind,
+                tree,
+                rt,
+                cgroup_hierarchy,
+                cgroup_monitor,
+                init_channel,
+            );
+        }
+    }
+}
+
+/// Clean shutdown: stop every service in order, then ask dynamod-init to
+/// finish (kill what is left, unmount, reboot(2)).
+fn perform_shutdown(
+    kind: ShutdownKind,
+    tree: &mut SupervisorTree,
+    rt: &Runtime,
+    cgroup_hierarchy: &CgroupHierarchy,
+    cgroup_monitor: &mut CgroupMonitor,
+    init_channel: &mut Option<InitChannel>,
+) -> ! {
+    shutdown::execute_shutdown(tree, &rt.dep_graph, cgroup_hierarchy, cgroup_monitor);
+    if let Some(ch) = init_channel {
+        match ch.request_shutdown(kind) {
+            Ok(()) => {
+                // dynamod-init now terminates every process, svmgr included.
+                // Wait for that rather than exiting, so that init cannot see
+                // svmgr exit (and restart it) before reading the request.
+                let deadline = Instant::now() + Duration::from_secs(30);
+                while Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(250));
+                }
+                tracing::error!("dynamod-init did not act on the shutdown request");
+            }
+            Err(e) => tracing::error!("failed to send shutdown request to init: {e}"),
+        }
+    }
+    std::process::exit(0);
+}
+
 fn dispatch_control_actions(
     actions: Vec<ipc::control::ControlAction>,
     tree: &mut SupervisorTree,
-    cgroup_hierarchy: &Option<cgroup::hierarchy::CgroupHierarchy>,
-    cgroup_monitor: &mut cgroup::monitor::CgroupMonitor,
+    rt: &mut Runtime,
+    cgroup_hierarchy: &CgroupHierarchy,
+    cgroup_monitor: &mut CgroupMonitor,
     init_channel: &mut Option<InitChannel>,
-    dep_graph: &dependency::graph::DependencyGraph,
 ) {
+    use ipc::control::ControlAction;
+
     for action in actions {
         match action {
-            ipc::control::ControlAction::StartService(name) => {
-                start_worker(tree, &name, cgroup_hierarchy, cgroup_monitor);
+            ControlAction::StartService(name) => {
+                let active = tree
+                    .get_worker(&name)
+                    .is_some_and(|w| w.pid.is_some() || w.state == ServiceState::Exited);
+                if active {
+                    tracing::info!("service '{name}' is already active");
+                } else {
+                    start_worker(tree, &name, cgroup_hierarchy, cgroup_monitor);
+                    if tree.get_worker(&name).is_some_and(|w| w.pid.is_none()) {
+                        service_failed(tree, &name, "could not be started");
+                    }
+                }
             }
-            ipc::control::ControlAction::StopService(name) => {
+            ControlAction::StopService(name) => {
                 stop_worker(tree, &name);
             }
-            ipc::control::ControlAction::RestartService(name) => {
+            ControlAction::RestartService(name) => {
                 let old_pid = tree.get_worker(&name).and_then(|w| w.pid);
                 stop_worker(tree, &name);
 
@@ -384,9 +613,8 @@ fn dispatch_control_actions(
                     let deadline = Instant::now() + Duration::from_secs(5);
                     loop {
                         reap_and_handle_exits(tree, cgroup_hierarchy, cgroup_monitor);
-                        let still_running = tree
-                            .get_worker(&name)
-                            .is_some_and(|w| w.pid == Some(pid));
+                        let still_running =
+                            tree.get_worker(&name).is_some_and(|w| w.pid == Some(pid));
                         if !still_running || Instant::now() >= deadline {
                             break;
                         }
@@ -396,22 +624,30 @@ fn dispatch_control_actions(
 
                 start_worker(tree, &name, cgroup_hierarchy, cgroup_monitor);
             }
-            ipc::control::ControlAction::Reload => {
+            ControlAction::Reload => {
                 tracing::info!("reload requested via control socket");
-                reload_services(tree, cgroup_hierarchy, cgroup_monitor);
+                reload_services(tree, rt, cgroup_hierarchy, cgroup_monitor);
             }
-            ipc::control::ControlAction::Shutdown(kind) => {
+            ControlAction::Shutdown(kind) => {
                 tracing::info!("shutdown requested via control socket");
-                shutdown::execute_shutdown(
+                rt.scheduled_shutdown = None;
+                perform_shutdown(
+                    kind,
                     tree,
-                    dep_graph,
+                    rt,
                     cgroup_hierarchy,
                     cgroup_monitor,
+                    init_channel,
                 );
-                if let Some(ch) = init_channel {
-                    let _ = ch.request_shutdown(kind);
+            }
+            ControlAction::ScheduleShutdown(kind, at) => {
+                tracing::info!("{kind:?} scheduled in {}s", at.saturating_sub(now_unix()));
+                rt.scheduled_shutdown = Some((kind, at));
+            }
+            ControlAction::CancelShutdown => {
+                if rt.scheduled_shutdown.take().is_some() {
+                    tracing::info!("scheduled shutdown cancelled");
                 }
-                std::process::exit(0);
             }
         }
     }
@@ -422,8 +658,8 @@ fn dispatch_control_actions(
 fn start_worker(
     tree: &mut SupervisorTree,
     worker_id: &str,
-    cgroup_hierarchy: &Option<cgroup::hierarchy::CgroupHierarchy>,
-    cgroup_monitor: &mut cgroup::monitor::CgroupMonitor,
+    cgroup_hierarchy: &CgroupHierarchy,
+    cgroup_monitor: &mut CgroupMonitor,
 ) -> Option<std::os::unix::io::RawFd> {
     let def = match tree.get_worker(worker_id) {
         Some(w) => w.def.clone(),
@@ -442,9 +678,7 @@ fn start_worker(
     }
 
     // Set up cgroup before spawning
-    let cgroup_path = if let (Some(hierarchy), Some(cg_config)) =
-        (cgroup_hierarchy, &def.cgroup)
-    {
+    let cgroup_path = if let (Some(hierarchy), Some(cg_config)) = (cgroup_hierarchy, &def.cgroup) {
         match hierarchy.create_service_cgroup(worker_id) {
             Ok(path) => {
                 if let Err(e) = cgroup::limits::apply_limits(&path, cg_config) {
@@ -498,8 +732,14 @@ fn start_worker(
     }
 }
 
-/// Stop a worker process (send SIGTERM, mark as stopping).
+/// Stop a worker: SIGTERM a running process (its exit is then handled as a
+/// stop, not a failure), or run the stop-exec of a remain-after-exit
+/// oneshot that is active.
 fn stop_worker(tree: &mut SupervisorTree, worker_id: &str) {
+    if shutdown::stop_exited_service(tree, worker_id) {
+        return;
+    }
+
     let pid = match tree.get_worker(worker_id) {
         Some(w) => w.pid,
         None => return,
@@ -517,97 +757,113 @@ fn stop_worker(tree: &mut SupervisorTree, worker_id: &str) {
     }
 }
 
+/// Oneshots in `pending` whose process was reaped elsewhere (e.g. by a
+/// restart during boot): settle them in the frontier from their state.
+fn settle_lost_oneshots(
+    tree: &SupervisorTree,
+    pending: &mut HashSet<String>,
+    frontier: &mut dependency::frontier::StartupFrontier,
+    boot_graph: &DependencyGraph,
+) {
+    let lost: Vec<String> = pending
+        .iter()
+        .filter(|n| tree.get_worker(n).is_none_or(|w| w.pid.is_none()))
+        .cloned()
+        .collect();
+    for name in lost {
+        pending.remove(&name);
+        let state = tree.get_worker(&name).map(|w| w.state.clone());
+        match state {
+            Some(ServiceState::Exited) | Some(ServiceState::Stopped) => {
+                frontier.mark_ready(&name, boot_graph)
+            }
+            _ => frontier.mark_failed(&name, boot_graph),
+        }
+    }
+}
+
 /// Reap exited children during the startup phase, handling oneshot completion.
 /// Oneshot services that exit with code 0 are marked ready in the frontier;
 /// those that exit with nonzero are marked failed.
 fn reap_oneshots_during_startup(
     tree: &mut SupervisorTree,
-    pending_oneshots: &mut std::collections::HashSet<String>,
+    pending_oneshots: &mut HashSet<String>,
     frontier: &mut dependency::frontier::StartupFrontier,
-    dep_graph: &dependency::graph::DependencyGraph,
-    cgroup_hierarchy: &Option<cgroup::hierarchy::CgroupHierarchy>,
-    cgroup_monitor: &mut cgroup::monitor::CgroupMonitor,
+    dep_graph: &DependencyGraph,
+    cgroup_hierarchy: &CgroupHierarchy,
+    cgroup_monitor: &mut CgroupMonitor,
 ) {
-    use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
+    use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
 
     loop {
-        match waitpid(None, Some(WaitPidFlag::WNOHANG)) {
-            Ok(WaitStatus::Exited(pid, code)) => {
-                let worker_id = tree.unregister_pid(pid.as_raw());
-                if let Some(ref name) = worker_id {
-                    if pending_oneshots.remove(name.as_str()) {
-                        // This is a pending oneshot — mark ready or failed
-                        if code == 0 {
-                            tracing::info!("oneshot '{name}' completed (code 0)");
-                            if let Some(TreeNode::Worker(w)) = tree.get_mut(name) {
-                                w.pid = None;
-                                w.state = ServiceState::Stopped;
-                            }
-                            cgroup_monitor.unwatch(name);
-                            if let Some(hierarchy) = cgroup_hierarchy {
-                                let _ = hierarchy.remove_service_cgroup(name);
-                            }
-                            frontier.mark_ready(name, dep_graph);
-                        } else {
-                            tracing::error!("oneshot '{name}' failed (code {code})");
-                            if let Some(TreeNode::Worker(w)) = tree.get_mut(name) {
-                                w.pid = None;
-                                w.state = ServiceState::Failed {
-                                    exit_code: Some(code),
-                                    signal: None,
-                                };
-                            }
-                            cgroup_monitor.unwatch(name);
-                            if let Some(hierarchy) = cgroup_hierarchy {
-                                let _ = hierarchy.remove_service_cgroup(name);
-                            }
-                            frontier.mark_failed(name, dep_graph);
-                        }
-                        continue;
-                    }
-                }
-                // Not a pending oneshot — handle normally
-                if let Some(name) = worker_id {
-                    // Re-register PID temporarily so handle_child_exit can unregister it
-                    tree.register_pid(&name, pid.as_raw());
-                    handle_child_exit(tree, pid.as_raw(), ExitInfo {
-                        exit_code: Some(code),
-                        signal: None,
-                    }, cgroup_hierarchy, cgroup_monitor);
-                }
-            }
-            Ok(WaitStatus::Signaled(pid, sig, _)) => {
-                let worker_id = tree.unregister_pid(pid.as_raw());
-                if let Some(ref name) = worker_id {
-                    if pending_oneshots.remove(name.as_str()) {
-                        tracing::error!("oneshot '{name}' killed (signal {sig})");
-                        if let Some(TreeNode::Worker(w)) = tree.get_mut(name) {
-                            w.pid = None;
-                            w.state = ServiceState::Failed {
-                                exit_code: None,
-                                signal: Some(sig as i32),
-                            };
-                        }
-                        cgroup_monitor.unwatch(name);
-                        if let Some(hierarchy) = cgroup_hierarchy {
-                            let _ = hierarchy.remove_service_cgroup(name);
-                        }
-                        frontier.mark_failed(name, dep_graph);
-                        continue;
-                    }
-                }
-                if let Some(name) = worker_id {
-                    tree.register_pid(&name, pid.as_raw());
-                    handle_child_exit(tree, pid.as_raw(), ExitInfo {
-                        exit_code: None,
-                        signal: Some(sig as i32),
-                    }, cgroup_hierarchy, cgroup_monitor);
-                }
-            }
+        let (pid, exit) = match waitpid(None, Some(WaitPidFlag::WNOHANG)) {
+            Ok(WaitStatus::Exited(pid, code)) => (
+                pid,
+                ExitInfo {
+                    exit_code: Some(code),
+                    signal: None,
+                },
+            ),
+            Ok(WaitStatus::Signaled(pid, sig, _)) => (
+                pid,
+                ExitInfo {
+                    exit_code: None,
+                    signal: Some(sig as i32),
+                },
+            ),
             Ok(WaitStatus::StillAlive) => break,
             Err(nix::errno::Errno::ECHILD) => break,
             Err(nix::errno::Errno::EINTR) => continue,
             _ => break,
+        };
+
+        let worker_id = tree.unregister_pid(pid.as_raw());
+        if let Some(ref name) = worker_id {
+            if pending_oneshots.remove(name.as_str()) {
+                // This is a pending oneshot — mark ready or failed
+                let remain = tree
+                    .get_worker(name)
+                    .is_some_and(|w| w.def.service.remain_after_exit);
+                if let Some(TreeNode::Worker(w)) = tree.get_mut(name) {
+                    w.pid = None;
+                    w.state = if exit.is_normal() {
+                        if remain {
+                            ServiceState::Exited
+                        } else {
+                            ServiceState::Stopped
+                        }
+                    } else {
+                        ServiceState::Failed {
+                            exit_code: exit.exit_code,
+                            signal: exit.signal,
+                        }
+                    };
+                }
+                cgroup_monitor.unwatch(name);
+                if let Some(hierarchy) = cgroup_hierarchy {
+                    let _ = hierarchy.remove_service_cgroup(name);
+                }
+                if exit.is_normal() {
+                    tracing::info!("oneshot '{name}' completed (code 0)");
+                    frontier.mark_ready(name, dep_graph);
+                } else {
+                    let reason = match (exit.exit_code, exit.signal) {
+                        (Some(code), _) => format!("exit code {code}"),
+                        (None, Some(sig)) => format!("killed by signal {sig}"),
+                        _ => "abnormal exit".to_string(),
+                    };
+                    tracing::error!("oneshot '{name}' failed ({reason})");
+                    frontier.mark_failed(name, dep_graph);
+                    service_failed(tree, name, &reason);
+                }
+                continue;
+            }
+        }
+        // Not a pending oneshot — handle normally
+        if let Some(name) = worker_id {
+            // Re-register PID temporarily so handle_child_exit can unregister it
+            tree.register_pid(&name, pid.as_raw());
+            handle_child_exit(tree, pid.as_raw(), exit, cgroup_hierarchy, cgroup_monitor);
         }
     }
 }
@@ -615,24 +871,36 @@ fn reap_oneshots_during_startup(
 /// Reap all zombie children and apply supervisor restart strategies.
 fn reap_and_handle_exits(
     tree: &mut SupervisorTree,
-    cgroup_hierarchy: &Option<cgroup::hierarchy::CgroupHierarchy>,
-    cgroup_monitor: &mut cgroup::monitor::CgroupMonitor,
+    cgroup_hierarchy: &CgroupHierarchy,
+    cgroup_monitor: &mut CgroupMonitor,
 ) {
-    use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
+    use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
 
     loop {
         match waitpid(None, Some(WaitPidFlag::WNOHANG)) {
             Ok(WaitStatus::Exited(pid, code)) => {
-                handle_child_exit(tree, pid.as_raw(), ExitInfo {
-                    exit_code: Some(code),
-                    signal: None,
-                }, cgroup_hierarchy, cgroup_monitor);
+                handle_child_exit(
+                    tree,
+                    pid.as_raw(),
+                    ExitInfo {
+                        exit_code: Some(code),
+                        signal: None,
+                    },
+                    cgroup_hierarchy,
+                    cgroup_monitor,
+                );
             }
             Ok(WaitStatus::Signaled(pid, sig, _)) => {
-                handle_child_exit(tree, pid.as_raw(), ExitInfo {
-                    exit_code: None,
-                    signal: Some(sig as i32),
-                }, cgroup_hierarchy, cgroup_monitor);
+                handle_child_exit(
+                    tree,
+                    pid.as_raw(),
+                    ExitInfo {
+                        exit_code: None,
+                        signal: Some(sig as i32),
+                    },
+                    cgroup_hierarchy,
+                    cgroup_monitor,
+                );
             }
             Ok(WaitStatus::StillAlive) => break,
             Err(nix::errno::Errno::ECHILD) => break,
@@ -647,8 +915,8 @@ fn handle_child_exit(
     tree: &mut SupervisorTree,
     pid: i32,
     exit_info: ExitInfo,
-    cgroup_hierarchy: &Option<cgroup::hierarchy::CgroupHierarchy>,
-    cgroup_monitor: &mut cgroup::monitor::CgroupMonitor,
+    cgroup_hierarchy: &CgroupHierarchy,
+    cgroup_monitor: &mut CgroupMonitor,
 ) {
     // Find which worker this PID belongs to
     let worker_id = match tree.unregister_pid(pid) {
@@ -665,63 +933,48 @@ fn handle_child_exit(
         tracing::warn!("service '{worker_id}' killed (signal {sig})");
     }
 
-    // Update worker state
-    if let Some(TreeNode::Worker(w)) = tree.get_mut(&worker_id) {
-        w.pid = None;
-        w.state = if exit_info.is_normal() {
-            ServiceState::Stopped
-        } else {
-            ServiceState::Failed {
-                exit_code: exit_info.exit_code,
-                signal: exit_info.signal,
-            }
-        };
-    }
-
     // Clean up cgroup for the exited service
     cgroup_monitor.unwatch(&worker_id);
     if let Some(hierarchy) = cgroup_hierarchy {
         let _ = hierarchy.remove_service_cgroup(&worker_id);
     }
 
-    // Find the parent supervisor
-    let supervisor_id = match tree.parent_of(&worker_id) {
-        Some(id) => id.to_string(),
-        None => return,
-    };
+    // Stopped on request, completed oneshot, or the supervisor's strategy
+    let decision = supervisor::exit::decide_exit(tree, &worker_id, &exit_info);
 
-    // Apply the supervisor's restart strategy
-    let action = strategy::apply_strategy(tree, &supervisor_id, &worker_id, &exit_info);
-
-    if action.supervisor_failed {
+    if let Some(ref supervisor_id) = decision.supervisor_failed {
         tracing::error!("supervisor '{supervisor_id}' failed (intensity exceeded)");
-
-        // Escalate to parent supervisor
-        if let Some((parent_id, parent_action)) =
-            strategy::escalate_failure(tree, &supervisor_id)
-        {
-            tracing::warn!("escalating failure to supervisor '{parent_id}'");
-            execute_strategy_action(tree, &parent_action, cgroup_hierarchy, cgroup_monitor);
-        } else {
-            tracing::error!("root supervisor failed — system degraded");
+        match decision.escalated_to {
+            Some(ref parent_id) => tracing::warn!("escalating failure to supervisor '{parent_id}'"),
+            None => tracing::error!("root supervisor failed — system degraded"),
         }
-        return;
     }
 
-    execute_strategy_action(tree, &action, cgroup_hierarchy, cgroup_monitor);
+    if decision.failed {
+        let reason = match (exit_info.exit_code, exit_info.signal) {
+            (Some(code), _) => format!("exit code {code}, not restarted"),
+            (None, Some(sig)) => format!("killed by signal {sig}, not restarted"),
+            _ => "not restarted".to_string(),
+        };
+        service_failed(tree, &worker_id, &reason);
+    }
+
+    for action in &decision.actions {
+        execute_strategy_action(tree, action, cgroup_hierarchy, cgroup_monitor);
+    }
 }
 
 /// Execute the stop/start actions from a strategy decision.
 fn execute_strategy_action(
     tree: &mut SupervisorTree,
     action: &strategy::StrategyAction,
-    cgroup_hierarchy: &Option<cgroup::hierarchy::CgroupHierarchy>,
-    cgroup_monitor: &mut cgroup::monitor::CgroupMonitor,
+    cgroup_hierarchy: &CgroupHierarchy,
+    cgroup_monitor: &mut CgroupMonitor,
 ) {
     // Stop children that need stopping
     for child_id in &action.to_stop {
         if let Some(TreeNode::Worker(w)) = tree.get(child_id) {
-            if w.state.is_running() {
+            if w.state.is_active() {
                 stop_worker(tree, child_id);
             }
         }
@@ -748,52 +1001,65 @@ fn execute_strategy_action(
     }
 }
 
-/// Reload service definitions: re-scan /etc/dynamod/services/,
-/// add new services, remove deleted ones.
+/// Reload definitions from the vendor and administrator directories:
+/// add new supervisors and services (starting new services that are
+/// enabled), update the definitions of existing services in place (used
+/// from their next start), and stop services whose definition is gone or
+/// masked.
 fn reload_services(
     tree: &mut SupervisorTree,
-    cgroup_hierarchy: &Option<cgroup::hierarchy::CgroupHierarchy>,
-    cgroup_monitor: &mut cgroup::monitor::CgroupMonitor,
+    rt: &mut Runtime,
+    cgroup_hierarchy: &CgroupHierarchy,
+    cgroup_monitor: &mut CgroupMonitor,
 ) {
-    let services_dir = std::path::Path::new(dynamod_common::paths::SERVICES_DIR);
-    let new_defs = match service::load_services_dir(services_dir) {
-        Ok(defs) => defs,
-        Err(e) => {
-            tracing::error!("reload: failed to load services: {e}");
-            return;
-        }
-    };
+    let root = rt.root.clone();
+    let root = root.as_deref();
 
-    let existing: std::collections::HashSet<String> = tree
-        .all_workers()
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
-    let loaded: std::collections::HashSet<String> = new_defs
-        .iter()
-        .map(|d| d.service.name.clone())
-        .collect();
-
-    // Start new services that weren't previously loaded
-    let mut added = 0;
-    for def in &new_defs {
-        if !existing.contains(&def.service.name) {
-            let parent = &def.service.supervisor;
-            let parent_id = if tree.get(parent).is_some() {
-                parent.as_str()
-            } else {
-                "root"
-            };
-            if let Err(e) = tree.add_worker(def.clone(), parent_id) {
-                tracing::error!("reload: failed to add '{}': {e}", def.service.name);
-                continue;
-            }
-            start_worker(tree, &def.service.name, cgroup_hierarchy, cgroup_monitor);
-            added += 1;
+    for sup_def in sup_config::load_supervisors(&paths::supervisor_dirs(root)) {
+        if sup_def.supervisor.name != "root" && tree.get(&sup_def.supervisor.name).is_none() {
+            add_supervisor(tree, &sup_def);
         }
     }
 
-    // Stop and remove services that no longer have config files
+    let new_defs = service::load_services(&paths::service_dirs(root));
+
+    let existing: HashSet<String> = tree.all_workers().iter().map(|s| s.to_string()).collect();
+    let mut loaded: HashSet<String> = HashSet::new();
+
+    let (mut added, mut updated) = (0, 0);
+    for def in new_defs {
+        let name = def.service.name.clone();
+        if !loaded.insert(name.clone()) {
+            tracing::error!(
+                "reload: duplicate service name '{name}', ignoring {:?}",
+                def.source
+            );
+            continue;
+        }
+        if existing.contains(&name) {
+            if let Some(w) = tree.get_worker_mut(&name) {
+                if w.def.service.supervisor != def.service.supervisor {
+                    tracing::warn!(
+                        "reload: '{name}' stays under supervisor '{}' until svmgr restarts",
+                        w.parent
+                    );
+                }
+                w.restart_policy = def.restart.policy.clone();
+                w.def = def;
+                updated += 1;
+            }
+            continue;
+        }
+        if !add_worker(tree, &def) {
+            continue;
+        }
+        added += 1;
+        if config_dirs::enablement(root, &name, def.service.enabled).enabled {
+            start_worker(tree, &name, cgroup_hierarchy, cgroup_monitor);
+        }
+    }
+
+    // Stop services that no longer have a definition
     let mut removed = 0;
     for name in &existing {
         if !loaded.contains(name) {
@@ -802,5 +1068,10 @@ fn reload_services(
         }
     }
 
-    tracing::info!("reload complete: {added} added, {removed} removed");
+    rt.dep_graph = DependencyGraph::build(&tree_defs(tree));
+    if let Err(e) = dependency::cycle::validate_no_cycles(&rt.dep_graph) {
+        tracing::error!("reload: {e}");
+    }
+
+    tracing::info!("reload complete: {added} added, {updated} updated, {removed} removed");
 }

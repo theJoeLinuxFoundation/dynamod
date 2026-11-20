@@ -35,7 +35,7 @@ dynamod has three layers:
 |-----------|----------|-------------|
 | **dynamod-init** | Zig | PID 1. Mounts filesystems, handles initramfs-to-rootfs transition, reaps zombies, manages shutdown. ~2300 lines across 14 files, no heap allocations, can't crash. |
 | **dynamod-svmgr** | Rust | The service manager. Reads TOML configs, builds a dependency graph, starts services in parallel, supervises them with OTP-style restart strategies, and enforces resource limits via cgroups v2. |
-| **dynamodctl** | Rust | CLI tool. `dynamodctl start nginx`, `dynamodctl tree`, `dynamodctl shutdown reboot`. |
+| **dynamodctl** | Rust | CLI tool. `dynamodctl start nginx`, `dynamodctl enable --now sshd`, `dynamodctl tree`. Also `reboot`, `poweroff`, `halt`, `shutdown` and a small `systemctl` (multi-call). |
 
 Plus the **systemd-mimic** layer for desktop compatibility:
 
@@ -52,16 +52,26 @@ Plus the **systemd-mimic** layer for desktop compatibility:
   cmdline (`root=UUID=...`), mounts it, and `switch_root`s to the real filesystem
 - **OTP-style supervisor trees** — one-for-one, one-for-all, rest-for-one
   strategies with restart intensity tracking and cascading failure escalation
+- **Vendor and administrator directories** — packages ship definitions in
+  `/usr/lib/dynamod/`, the administrator overrides or masks them in `/etc/dynamod/`
+- **Enabled and disabled services** — `enabled = false` in the definition, or
+  `dynamodctl enable|disable [--now]` (markers in `/etc/dynamod/{enabled,disabled}/`)
 - **Dependency-aware parallel startup** — services declare `requires`, `wants`,
-  `after`, `before`; a dynamic frontier algorithm starts everything as fast as possible
+  `after`, `before`; a dynamic frontier algorithm starts everything as fast as possible;
+  `after-all` services start once the rest of the boot has settled
 - **Readiness detection** — sd_notify, TCP port polling, exec health checks, or
   file descriptor signaling
 - **Cgroups v2** — per-service memory, CPU, PID, and I/O limits with OOM detection
 - **Linux namespaces** — PID, mount, network, UTS, IPC isolation per service
 - **systemd compatibility** — D-Bus interfaces for login1, systemd1, hostname1;
   Wayland compositors and GNOME Shell work without modification
+- **Oneshots that stay up** — `remain-after-exit` oneshots are active until
+  stopped, and their `stop-exec` runs at shutdown (`last = true`: after everything else)
+- **Failure actions** — `failure-action = "reboot" | "poweroff" | "reboot-force"`
 - **Graceful shutdown** — reverse dependency order, per-service stop commands
-  and timeouts, SIGKILL escalation, filesystem sync
+  and timeouts, SIGKILL escalation, filesystem sync; `shutdown +M`/`HH:MM` scheduling
+- **The usual commands** — `reboot`, `poweroff`, `halt`, `shutdown`, and a
+  `systemctl` front end for scripts (services only; it says it is not systemd)
 - **Crash resilience** — the Zig PID 1 uses no heap allocations and auto-restarts
   the service manager with exponential backoff if it crashes
 - **Emergency shell** — if the service manager hits a crash loop, init drops to
@@ -111,7 +121,7 @@ See [docs/docker.md](docs/docker.md) for details.
 **1. Define a service:**
 
 ```toml
-# /etc/dynamod/services/myapp.toml
+# /etc/dynamod/services/myapp.toml  (packages use /usr/lib/dynamod/services/)
 [service]
 name = "myapp"
 exec = ["/usr/bin/myapp", "--port", "8080"]
@@ -136,7 +146,12 @@ dynamodctl start myapp       # Start a service
 dynamodctl status myapp      # Check its status (running, pid, supervisor)
 dynamodctl restart myapp     # Restart it
 dynamodctl tree              # View the full supervisor tree
+dynamodctl enable --now sshd # Start sshd at boot, and now
+dynamodctl is-enabled sshd   # Exit 0 if enabled at boot
 dynamodctl shutdown reboot   # Reboot the system
+reboot                       # Same (dynamodctl as reboot/poweroff/halt/shutdown)
+shutdown -r +5 "kernel update"
+systemctl status sshd        # The systemctl front end
 ```
 
 ## Booting from disk
@@ -185,8 +200,10 @@ sudo test/alpine/boot-gnome.sh    # GNOME Shell desktop test
 
 ## Configuration
 
-Services live in `/etc/dynamod/services/*.toml`, supervisors in
-`/etc/dynamod/supervisors/*.toml`. See [docs/configuration.md](docs/configuration.md)
+Services live in `/usr/lib/dynamod/services/*.toml` (packages) and
+`/etc/dynamod/services/*.toml` (administrator: a file of the same name
+replaces the packaged one, a symlink to `/dev/null` masks it); supervisors
+likewise in `.../supervisors/`. See [docs/configuration.md](docs/configuration.md)
 for the full reference.
 
 ## Documentation
