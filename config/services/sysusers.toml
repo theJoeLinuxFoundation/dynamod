@@ -1,0 +1,23 @@
+# System users and groups that packages declare in sysusers.d(5)
+# (dynamod-sysusers, compatible with systemd-sysusers). Runs once /etc is
+# writable, before tmpfiles-setup, which may give files to these accounts.
+[service]
+name = "sysusers"
+supervisor = "early-boot"
+exec = ["/usr/bin/dynamod-sysusers"]
+type = "oneshot"
+
+[restart]
+policy = "temporary"
+
+[dependencies]
+requires = ["remount-root-rw"]
+after = ["fstab-mount"]
+before = ["tmpfiles-setup"]
+
+[readiness]
+type = "none"
+
+[shutdown]
+stop-signal = "SIGTERM"
+stop-timeout = "20s"

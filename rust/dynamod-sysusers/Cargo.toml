@@ -1,0 +1,12 @@
+[package]
+name = "dynamod-sysusers"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "dynamod-sysusers"
+path = "src/main.rs"
+
+[dependencies]
+dynamod-sdconf = { path = "../dynamod-sdconf" }
+libc = "0.2"

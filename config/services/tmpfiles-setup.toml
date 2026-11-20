@@ -1,0 +1,29 @@
+# Files and directories that packages declare in tmpfiles.d(5)
+# (dynamod-tmpfiles, compatible with systemd-tmpfiles), as
+# systemd-tmpfiles-setup.service does at every boot: lines marked "!" too,
+# and what is marked for removal removed first.
+#
+# Once the root is writable and the local file systems are mounted, after
+# the accounts the lines may name (sysusers) and the machine ID ("%m").
+# Only "after" those: a failure there still lets this run. Services that
+# need what it creates (/var/lib/NAME, /run/NAME) should be
+# `after = ["tmpfiles-setup"]`.
+[service]
+name = "tmpfiles-setup"
+supervisor = "early-boot"
+exec = ["/usr/bin/dynamod-tmpfiles", "--create", "--remove", "--boot"]
+type = "oneshot"
+
+[restart]
+policy = "temporary"
+
+[dependencies]
+requires = ["remount-root-rw"]
+after = ["fstab-mount", "sysusers", "machine-id"]
+
+[readiness]
+type = "none"
+
+[shutdown]
+stop-signal = "SIGTERM"
+stop-timeout = "30s"

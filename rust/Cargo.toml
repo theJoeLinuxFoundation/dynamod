@@ -8,6 +8,9 @@ members = [
     "dynamod-logind",
     "dynamod-sd1bridge",
     "dynamod-hostnamed",
+    "dynamod-sdconf",
+    "dynamod-tmpfiles",
+    "dynamod-sysusers",
 ]
 # dynamod-sdnotify is excluded from the default workspace build because it
 # produces a cdylib (libsystemd.so) which requires the glibc target — musl

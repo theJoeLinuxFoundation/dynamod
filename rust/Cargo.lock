@@ -193,6 +193,7 @@ checksum = "d0a5c400df2834b80a4c3327b3aad3a4c4cd4de0629063962b03235697506a28"
 name = "dynamod-common"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "rmp-serde",
  "serde",
  "thiserror",
@@ -251,6 +252,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "dynamod-sdconf"
+version = "0.1.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "dynamod-svmgr"
 version = "0.1.0"
 dependencies = [
@@ -266,13 +274,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "dynamod-sysusers"
+version = "0.1.0"
+dependencies = [
+ "dynamod-sdconf",
+ "libc",
+]
+
+[[package]]
+name = "dynamod-tmpfiles"
+version = "0.1.0"
+dependencies = [
+ "dynamod-sdconf",
+ "libc",
+]
+
+[[package]]
 name = "dynamodctl"
 version = "0.1.0"
 dependencies = [
  "clap",
  "dynamod-common",
+ "libc",
  "rmp-serde",
  "serde",
+ "toml",
 ]
 
 [[package]]

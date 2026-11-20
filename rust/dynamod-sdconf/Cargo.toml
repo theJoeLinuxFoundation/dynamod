@@ -1,0 +1,8 @@
+[package]
+name = "dynamod-sdconf"
+version.workspace = true
+edition.workspace = true
+description = "Shared support for dynamod's systemd-compatible configuration tools (tmpfiles.d, sysusers.d)"
+
+[dependencies]
+libc = "0.2"
