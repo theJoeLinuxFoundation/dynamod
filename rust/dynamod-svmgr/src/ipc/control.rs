@@ -3,6 +3,7 @@
 /// Listens on /run/dynamod/control.sock for commands from dynamodctl.
 /// Each connection handles one request-response exchange.
 use std::io::{Read, Write};
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 
@@ -26,7 +27,9 @@ impl ControlServer {
         // Remove stale socket file
         let _ = std::fs::remove_file(path);
         if let Some(dir) = path.parent() {
-            let _ = std::fs::create_dir_all(dir);
+            std::fs::create_dir_all(dir)?;
+            // Unprivileged daemons must be able to reach their notify sockets.
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755))?;
         }
 
         let listener = UnixListener::bind(path)?;
@@ -35,7 +38,6 @@ impl ControlServer {
         // Make socket world-readable so dynamodctl can connect
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
             let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o660));
         }
 

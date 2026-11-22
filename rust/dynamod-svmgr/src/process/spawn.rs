@@ -40,7 +40,7 @@ pub enum SpawnError {
 
 /// Spawn a service process based on its definition.
 /// Returns the PID and pidfd of the spawned process.
-pub fn spawn_service(def: &ServiceDef) -> Result<SpawnedProcess, SpawnError> {
+pub fn spawn_service(def: &ServiceDef, notify_socket: Option<&Path>) -> Result<SpawnedProcess, SpawnError> {
     if def.service.exec.is_empty() {
         return Err(SpawnError::EmptyExec);
     }
@@ -95,9 +95,8 @@ pub fn spawn_service(def: &ServiceDef) -> Result<SpawnedProcess, SpawnError> {
     }
 
     // Set NOTIFY_SOCKET for sd_notify-compatible services
-    if def.readiness.readiness_type == ReadinessType::Notify {
-        let notify_path = format!("/run/dynamod/notify-{}.sock", def.service.name);
-        env_map.insert("NOTIFY_SOCKET".to_string(), notify_path);
+    if let Some(path) = notify_socket {
+        env_map.insert("NOTIFY_SOCKET".to_string(), path.display().to_string());
     }
 
     let env: Vec<CString> = env_map

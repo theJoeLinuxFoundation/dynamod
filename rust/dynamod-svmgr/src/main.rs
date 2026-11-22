@@ -9,7 +9,8 @@ mod shutdown;
 mod supervisor;
 mod system_action;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
+use std::os::fd::{FromRawFd, OwnedFd};
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -18,6 +19,7 @@ use config::supervisor as sup_config;
 use config::validate;
 use dependency::graph::DependencyGraph;
 use ipc::init_channel::InitChannel;
+use process::readiness::{ReadinessResult, ReadinessTracker};
 use process::spawn;
 use supervisor::intensity::RestartIntensity;
 use supervisor::lifecycle::{ExitInfo, ServiceState};
@@ -189,8 +191,7 @@ fn main() {
     // Start services using the dynamic frontier algorithm
     let mut frontier =
         dependency::frontier::StartupFrontier::with_after_all(&boot_graph, after_all);
-    let mut readiness_trackers: HashMap<String, process::readiness::ReadinessTracker> =
-        HashMap::new();
+    let mut pending_readiness = HashSet::new();
     // Oneshot services waiting for process exit before being marked ready
     let mut pending_oneshots: HashSet<String> = HashSet::new();
 
@@ -220,22 +221,19 @@ fn main() {
         // Start any services whose dependencies are satisfied
         let batch = frontier.take_ready();
         for name in &batch {
-            // Started explicitly while it was waiting for its dependencies?
-            if tree
-                .get_worker(name)
-                .is_some_and(|w| w.pid.is_some() || w.state == ServiceState::Exited)
-            {
-                tracing::info!("service '{name}' already started");
-                frontier.mark_ready(name, &boot_graph);
-                continue;
+            // An explicit start may already be waiting for readiness.
+            if !tree.get_worker(name).is_some_and(|w| w.pid.is_some() || w.state == ServiceState::Exited) {
+                start_worker(&mut tree, name, &cgroup_hierarchy, &mut cgroup_monitor);
             }
-
-            let ready_fd = start_worker(&mut tree, name, &cgroup_hierarchy, &mut cgroup_monitor);
 
             let Some(w) = tree.get_worker(name) else {
                 frontier.mark_failed(name, &boot_graph);
                 continue;
             };
+            if w.state == ServiceState::Exited {
+                frontier.mark_ready(name, &boot_graph);
+                continue;
+            }
             if w.pid.is_none() {
                 // Spawning failed
                 frontier.mark_failed(name, &boot_graph);
@@ -245,54 +243,39 @@ fn main() {
 
             // Set up readiness tracking
             let is_oneshot = w.def.service.service_type == ServiceType::Oneshot;
-            let mut tracker = process::readiness::ReadinessTracker::new(&w.def.readiness, name);
-
-            // Wire in the ready_fd if present
-            if let Some(fd) = ready_fd {
-                tracker.set_ready_fd(fd);
-            }
-
-            if is_oneshot && tracker.is_immediate() {
+            if w.readiness.is_some() {
+                pending_readiness.insert(name.clone());
+            } else if is_oneshot {
                 // Oneshot with no readiness check: wait for process exit
                 pending_oneshots.insert(name.clone());
                 tracing::info!("service '{name}' is oneshot, waiting for exit");
-            } else if tracker.is_immediate() {
+            } else {
                 // Long-running service with no readiness check: ready immediately
                 frontier.mark_ready(name, &boot_graph);
                 tracing::info!("service '{name}' ready (immediate)");
-            } else {
-                readiness_trackers.insert(name.clone(), tracker);
             }
         }
 
-        // Poll pending readiness checks
-        let tracker_names: Vec<String> = readiness_trackers.keys().cloned().collect();
-        for name in tracker_names {
-            let result = readiness_trackers[&name].check();
-            match result {
-                process::readiness::ReadinessResult::Ready => {
-                    tracing::info!("service '{name}' ready");
-                    readiness_trackers.remove(&name);
-                    frontier.mark_ready(&name, &boot_graph);
+        poll_readiness(&mut tree, |name, ready| {
+            if pending_readiness.remove(name) {
+                if ready {
+                    frontier.mark_ready(name, &boot_graph);
+                } else {
+                    frontier.mark_failed(name, &boot_graph);
                 }
-                process::readiness::ReadinessResult::TimedOut => {
-                    tracing::error!("service '{name}' readiness timed out");
-                    readiness_trackers.remove(&name);
-                    frontier.mark_failed(&name, &boot_graph);
-                    service_failed(&tree, &name, "readiness timed out");
-                }
-                process::readiness::ReadinessResult::Failed(ref msg) => {
-                    tracing::error!("service '{name}' readiness failed: {msg}");
-                    readiness_trackers.remove(&name);
-                    frontier.mark_failed(&name, &boot_graph);
-                    service_failed(&tree, &name, "readiness check failed");
-                }
-                process::readiness::ReadinessResult::NotReady => {}
             }
-        }
+        });
+        // A restart can fail before it has a new tracker.
+        pending_readiness.retain(|name| {
+            if tree.get_worker(name).is_some_and(|w| w.readiness.is_some()) {
+                return true;
+            }
+            frontier.mark_failed(name, &boot_graph);
+            false
+        });
 
         // If no more work to do, break out of startup
-        if !frontier.has_ready() && readiness_trackers.is_empty() && pending_oneshots.is_empty() {
+        if !frontier.has_ready() && pending_readiness.is_empty() && pending_oneshots.is_empty() {
             break;
         }
 
@@ -345,6 +328,8 @@ fn main() {
 
         // Reap exited children and apply supervisor strategies
         reap_and_handle_exits(&mut tree, &cgroup_hierarchy, &mut cgroup_monitor);
+
+        poll_readiness(&mut tree, |_, _| {});
 
         // Handle control socket requests
         if let Some(ref server) = control_server {
@@ -653,17 +638,54 @@ fn dispatch_control_actions(
     }
 }
 
+/// Poll trackers from boot, explicit starts and automatic restarts alike.
+fn poll_readiness(tree: &mut SupervisorTree, mut report: impl FnMut(&str, bool)) {
+    let mut failures = Vec::new();
+    for worker in tree.workers_mut() {
+        let Some(tracker) = &worker.readiness else { continue };
+        let result = match worker.pid {
+            Some(pid) => tracker.check(pid),
+            None => ReadinessResult::Failed("service exited before readiness".into()),
+        };
+        match result {
+            ReadinessResult::NotReady => continue,
+            ReadinessResult::Ready => {
+                tracing::info!("service '{}' ready", worker.name);
+                report(&worker.name, true);
+            }
+            error => {
+                tracing::error!("service '{}' readiness: {error:?}", worker.name);
+                report(&worker.name, false);
+                if worker.pid.is_some() {
+                    failures.push(worker.name.clone());
+                }
+            }
+        }
+        worker.readiness = None;
+    }
+    for name in failures {
+        service_failed(tree, &name, "readiness check failed");
+    }
+}
+
 /// Start a worker process and register it in the tree.
-/// Returns the ready_fd (read end) if the service uses fd-based readiness.
 fn start_worker(
     tree: &mut SupervisorTree,
     worker_id: &str,
     cgroup_hierarchy: &CgroupHierarchy,
     cgroup_monitor: &mut CgroupMonitor,
-) -> Option<std::os::unix::io::RawFd> {
-    let def = match tree.get_worker(worker_id) {
-        Some(w) => w.def.clone(),
-        None => return None,
+) {
+    let Some(worker) = tree.get_worker_mut(worker_id) else { return };
+    let def = worker.def.clone();
+    // Release the previous instance's socket before binding the new one.
+    worker.readiness = None;
+    let mut tracker = match ReadinessTracker::new(&def.readiness, worker_id) {
+        Ok(tracker) => tracker,
+        Err(e) => {
+            tracing::error!("failed to set up readiness for '{worker_id}': {e}");
+            worker.state = ServiceState::Failed { exit_code: None, signal: None };
+            return;
+        }
     };
 
     // Log namespace info if configured
@@ -695,13 +717,17 @@ fn start_worker(
         None
     };
 
-    match spawn::spawn_service(&def) {
+    match spawn::spawn_service(&def, tracker.notify_socket_path()) {
         Ok(spawned) => {
             let pid = spawned.pid.as_raw();
-            let ready_fd = spawned.ready_fd;
+            if let Some(fd) = spawned.ready_fd {
+                tracker.set_ready_fd(unsafe { OwnedFd::from_raw_fd(fd) });
+            }
             tree.register_pid(worker_id, pid);
             if let Some(TreeNode::Worker(w)) = tree.get_mut(worker_id) {
-                w.state = ServiceState::Running;
+                if !tracker.is_immediate() {
+                    w.readiness = Some(tracker);
+                }
             }
 
             // Move the process into its cgroup
@@ -712,8 +738,6 @@ fn start_worker(
                 // Start monitoring the cgroup
                 cgroup_monitor.watch(worker_id, &hierarchy.service_path(worker_id));
             }
-
-            ready_fd
         }
         Err(e) => {
             tracing::error!("failed to start '{}': {e}", worker_id);
@@ -727,7 +751,6 @@ fn start_worker(
             if let Some(hierarchy) = cgroup_hierarchy {
                 let _ = hierarchy.remove_service_cgroup(worker_id);
             }
-            None
         }
     }
 }

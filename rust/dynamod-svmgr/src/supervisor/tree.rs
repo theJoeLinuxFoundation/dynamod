@@ -43,6 +43,7 @@ pub struct WorkerNode {
     pub start_index: usize,
     /// Parent supervisor.
     pub parent: NodeId,
+    pub readiness: Option<crate::process::readiness::ReadinessTracker>,
     /// Current PID if running.
     pub pid: Option<i32>,
 }
@@ -151,6 +152,7 @@ impl SupervisorTree {
             restart_policy,
             start_index,
             parent: parent_id.to_string(),
+            readiness: None,
             pid: None,
         };
 
@@ -243,6 +245,13 @@ impl SupervisorTree {
             Some(TreeNode::Supervisor(s)) => s.parent.as_deref(),
             None => None,
         }
+    }
+
+    pub fn workers_mut(&mut self) -> impl Iterator<Item = &mut WorkerNode> {
+        self.nodes.values_mut().filter_map(|node| match node {
+            TreeNode::Worker(worker) => Some(worker),
+            TreeNode::Supervisor(_) => None,
+        })
     }
 
     /// Get all worker names in the tree.

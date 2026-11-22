@@ -6,10 +6,16 @@
 /// - **tcp-port**: Poll a TCP port until it accepts connections
 /// - **exec**: Run a health-check command; ready when it exits 0
 /// - **fd**: Service writes a byte to a passed file descriptor
+use nix::errno::Errno;
+use nix::sys::socket::{
+    ControlMessageOwned, MsgFlags, UnixAddr, bind, recvmsg, setsockopt, sockopt,
+};
+use std::io::{self, IoSliceMut};
 use std::net::TcpStream;
-use std::os::unix::io::RawFd;
+use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixDatagram;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use crate::config::service::{ReadinessSection, ReadinessType};
@@ -39,41 +45,27 @@ pub struct ReadinessTracker {
     /// Bound notify socket (created once, polled on each check)
     bound_notify: Option<UnixDatagram>,
     /// Read end of the fd-based readiness pipe (parent polls this).
-    ready_fd: Option<RawFd>,
+    ready_fd: Option<OwnedFd>,
 }
 
 impl ReadinessTracker {
     /// Create a readiness tracker from the service's readiness config.
-    pub fn new(config: &ReadinessSection, service_name: &str) -> Self {
+    pub fn new(config: &ReadinessSection, service_name: &str) -> io::Result<Self> {
         let timeout = crate::config::service::parse_duration_secs(&config.timeout)
             .map(Duration::from_secs)
             .unwrap_or(Duration::from_secs(30));
 
         let notify_socket = if config.readiness_type == ReadinessType::Notify {
-            Some(PathBuf::from(format!(
-                "/run/dynamod/notify-{}.sock",
-                service_name
-            )))
+            let root = dynamod_common::paths::root_from_env();
+            let dir =
+                dynamod_common::paths::rooted(root.as_deref(), dynamod_common::paths::RUN_DIR);
+            Some(dir.join(format!("notify-{service_name}.sock")))
         } else {
             None
         };
+        let bound_notify = notify_socket.as_deref().map(bind_notify).transpose()?;
 
-        // Bind the notify socket once at construction
-        let bound_notify = notify_socket.as_ref().and_then(|path| {
-            let _ = std::fs::remove_file(path);
-            match UnixDatagram::bind(path) {
-                Ok(sock) => {
-                    sock.set_nonblocking(true).ok();
-                    Some(sock)
-                }
-                Err(e) => {
-                    tracing::warn!("failed to bind notify socket {}: {e}", path.display());
-                    None
-                }
-            }
-        });
-
-        Self {
+        Ok(Self {
             readiness_type: config.readiness_type.clone(),
             port: config.port,
             check_exec: config.check_exec.clone(),
@@ -82,16 +74,16 @@ impl ReadinessTracker {
             notify_socket,
             bound_notify,
             ready_fd: None,
-        }
+        })
     }
 
     /// Get the NOTIFY_SOCKET path (for sd_notify compatible services).
-    pub fn notify_socket_path(&self) -> Option<&PathBuf> {
-        self.notify_socket.as_ref()
+    pub fn notify_socket_path(&self) -> Option<&Path> {
+        self.notify_socket.as_deref()
     }
 
     /// Set the read end of the fd-based readiness pipe.
-    pub fn set_ready_fd(&mut self, fd: RawFd) {
+    pub fn set_ready_fd(&mut self, fd: OwnedFd) {
         self.ready_fd = Some(fd);
     }
 
@@ -101,7 +93,7 @@ impl ReadinessTracker {
     }
 
     /// Perform a readiness check. Non-blocking.
-    pub fn check(&self) -> ReadinessResult {
+    pub fn check(&self, main_pid: i32) -> ReadinessResult {
         if self.started_at.elapsed() > self.timeout {
             return ReadinessResult::TimedOut;
         }
@@ -110,7 +102,7 @@ impl ReadinessTracker {
             ReadinessType::None => ReadinessResult::Ready,
             ReadinessType::TcpPort => self.check_tcp_port(),
             ReadinessType::Exec => self.check_exec(),
-            ReadinessType::Notify => self.check_notify(),
+            ReadinessType::Notify => self.check_notify(main_pid),
             ReadinessType::Fd => self.check_fd(),
         }
     }
@@ -123,10 +115,7 @@ impl ReadinessTracker {
         };
 
         let addr = format!("127.0.0.1:{port}");
-        match TcpStream::connect_timeout(
-            &addr.parse().unwrap(),
-            Duration::from_millis(200),
-        ) {
+        match TcpStream::connect_timeout(&addr.parse().unwrap(), Duration::from_millis(200)) {
             Ok(_) => ReadinessResult::Ready,
             Err(_) => ReadinessResult::NotReady,
         }
@@ -152,53 +141,33 @@ impl ReadinessTracker {
     }
 
     /// Check for sd_notify readiness (READY=1 on the notify socket).
-    fn check_notify(&self) -> ReadinessResult {
-        let sock = match &self.bound_notify {
-            Some(s) => s,
-            None => return ReadinessResult::Failed("no notify socket".into()),
+    fn check_notify(&self, main_pid: i32) -> ReadinessResult {
+        let Some(sock) = &self.bound_notify else {
+            return ReadinessResult::Failed("no notify socket".into());
         };
-
-        let mut buf = [0u8; 256];
-        match sock.recv(&mut buf) {
-            Ok(n) => {
-                let msg = std::str::from_utf8(&buf[..n]).unwrap_or("");
-                if msg.contains("READY=1") {
-                    // Clean up socket file
-                    if let Some(ref path) = self.notify_socket {
-                        let _ = std::fs::remove_file(path);
-                    }
-                    ReadinessResult::Ready
-                } else {
-                    ReadinessResult::NotReady
-                }
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                ReadinessResult::NotReady
-            }
-            Err(_) => ReadinessResult::NotReady,
+        match receive_notify(sock, main_pid) {
+            Ok(true) => ReadinessResult::Ready,
+            Ok(false) => ReadinessResult::NotReady,
+            Err(e) => ReadinessResult::Failed(format!("notify socket: {e}")),
         }
     }
 
     /// Check for fd-based readiness (service writes a byte to the pipe).
     fn check_fd(&self) -> ReadinessResult {
-        let fd = match self.ready_fd {
+        let fd = match &self.ready_fd {
             Some(fd) => fd,
             None => return ReadinessResult::Failed("no ready fd configured".into()),
         };
 
         // Non-blocking read: check if any byte has arrived
         let mut buf = [0u8; 1];
-        let result = unsafe {
-            libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, 1)
-        };
+        let result =
+            unsafe { libc::read(fd.as_raw_fd(), buf.as_mut_ptr() as *mut libc::c_void, 1) };
 
         if result > 0 {
-            // Close the read end now that we've received the signal
-            unsafe { libc::close(fd); }
             ReadinessResult::Ready
         } else if result == 0 {
             // Pipe closed without writing — service exited without signaling
-            unsafe { libc::close(fd); }
             ReadinessResult::Failed("ready fd closed without signal".into())
         } else {
             let err = std::io::Error::last_os_error();
@@ -209,37 +178,102 @@ impl ReadinessTracker {
             }
         }
     }
+}
 
-    /// Reset the timer (e.g. after a restart).
-    pub fn reset(&mut self) {
-        self.started_at = Instant::now();
+impl Drop for ReadinessTracker {
+    fn drop(&mut self) {
+        if let Some(path) = &self.notify_socket {
+            let _ = std::fs::remove_file(path);
+        }
     }
 }
 
-/// Poll readiness for a service with retries.
-/// This is a blocking helper for simple cases; the real event loop
-/// will use non-blocking checks.
-pub fn wait_for_ready(
-    tracker: &ReadinessTracker,
-    poll_interval: Duration,
-) -> ReadinessResult {
-    if tracker.is_immediate() {
-        return ReadinessResult::Ready;
+fn bind_notify(path: &Path) -> io::Result<UnixDatagram> {
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
     }
+    let sock = UnixDatagram::unbound()?;
+    setsockopt(&sock, sockopt::PassCred, &true)?;
+    sock.set_nonblocking(true)?;
+    bind(sock.as_raw_fd(), &UnixAddr::new(path)?)?;
+    // A daemon may drop its uid before sending READY=1.
+    if let Err(e) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o666)) {
+        let _ = std::fs::remove_file(path);
+        return Err(e);
+    }
+    Ok(sock)
+}
 
-    loop {
-        match tracker.check() {
-            ReadinessResult::NotReady => {
-                std::thread::sleep(poll_interval);
-            }
-            result => return result,
+fn receive_notify(sock: &UnixDatagram, main_pid: i32) -> io::Result<bool> {
+    // Bound each poll so a busy socket cannot monopolize the service manager.
+    let mut buf = [0; 8192];
+    let mut control = nix::cmsg_space!(libc::ucred);
+    for _ in 0..16 {
+        let mut iov = [IoSliceMut::new(&mut buf)];
+        let msg = match recvmsg::<()>(
+            sock.as_raw_fd(),
+            &mut iov,
+            Some(&mut control),
+            MsgFlags::MSG_CMSG_CLOEXEC,
+        ) {
+            Ok(msg) => msg,
+            Err(Errno::EAGAIN) => return Ok(false),
+            Err(Errno::EINTR) => continue,
+            Err(e) => return Err(e.into()),
+        };
+        if msg
+            .flags
+            .intersects(MsgFlags::MSG_CTRUNC | MsgFlags::MSG_TRUNC)
+        {
+            continue;
+        }
+        let authenticated = msg.cmsgs()?.any(|cmsg| {
+            matches!(
+                cmsg, ControlMessageOwned::ScmCredentials(cred) if cred.pid() == main_pid
+            )
+        });
+        let n = msg.bytes;
+        if authenticated
+            && buf[..n]
+                .split(|&b| b == b'\n')
+                .any(|field| field == b"READY=1")
+        {
+            return Ok(true);
         }
     }
+    Ok(false)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn notify_requires_main_pid_and_complete_ready_field() {
+        let pid = std::process::id() as i32;
+        let path = std::env::temp_dir().join(format!("dynamod-notify-test-{pid}.sock"));
+        let socket = bind_notify(&path).unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o666
+        );
+        let sender = UnixDatagram::unbound().unwrap();
+        sender.send_to(b"READY=1", &path).unwrap();
+        // The real sender has the same uid as the authorized service.
+        assert!(!receive_notify(&socket, pid + 1).unwrap());
+        for field in [b"STATUS=READY=1".as_slice(), b"READY=10", b"NOTREADY=1"] {
+            sender.send_to(field, &path).unwrap();
+            assert!(!receive_notify(&socket, pid).unwrap());
+        }
+        sender
+            .send_to(b"STATUS=clock synchronized\nREADY=1\n", &path)
+            .unwrap();
+        assert!(receive_notify(&socket, pid).unwrap());
+        assert!(!receive_notify(&socket, pid).unwrap());
+        std::fs::remove_file(path).unwrap();
+    }
 
     #[test]
     fn test_none_readiness_immediate() {
@@ -249,9 +283,12 @@ mod tests {
             check_exec: None,
             timeout: "30s".into(),
         };
-        let tracker = ReadinessTracker::new(&config, "test");
+        let tracker = ReadinessTracker::new(&config, "test").unwrap();
         assert!(tracker.is_immediate());
-        assert_eq!(tracker.check(), ReadinessResult::Ready);
+        assert_eq!(
+            tracker.check(std::process::id() as i32),
+            ReadinessResult::Ready
+        );
     }
 
     #[test]
@@ -262,9 +299,12 @@ mod tests {
             check_exec: None,
             timeout: "5s".into(),
         };
-        let tracker = ReadinessTracker::new(&config, "test");
+        let tracker = ReadinessTracker::new(&config, "test").unwrap();
         assert!(!tracker.is_immediate());
-        assert_eq!(tracker.check(), ReadinessResult::NotReady);
+        assert_eq!(
+            tracker.check(std::process::id() as i32),
+            ReadinessResult::NotReady
+        );
     }
 
     #[test]
@@ -275,8 +315,11 @@ mod tests {
             check_exec: Some(vec!["true".into()]),
             timeout: "5s".into(),
         };
-        let tracker = ReadinessTracker::new(&config, "test");
-        assert_eq!(tracker.check(), ReadinessResult::Ready);
+        let tracker = ReadinessTracker::new(&config, "test").unwrap();
+        assert_eq!(
+            tracker.check(std::process::id() as i32),
+            ReadinessResult::Ready
+        );
     }
 
     #[test]
@@ -287,7 +330,10 @@ mod tests {
             check_exec: Some(vec!["false".into()]),
             timeout: "5s".into(),
         };
-        let tracker = ReadinessTracker::new(&config, "test");
-        assert_eq!(tracker.check(), ReadinessResult::NotReady);
+        let tracker = ReadinessTracker::new(&config, "test").unwrap();
+        assert_eq!(
+            tracker.check(std::process::id() as i32),
+            ReadinessResult::NotReady
+        );
     }
 }
