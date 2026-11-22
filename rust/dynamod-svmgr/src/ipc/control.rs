@@ -12,6 +12,7 @@ use dynamod_common::protocol::{
     self, Message, MessageBody, MessageKind, ServiceDetails, ServiceEntry,
 };
 
+use crate::supervisor::lifecycle::ServiceState;
 use crate::supervisor::tree::{SupervisorTree, TreeNode};
 
 /// The control socket server.
@@ -46,14 +47,12 @@ impl ControlServer {
     }
 
     /// Accept and handle any pending connections (non-blocking).
-    /// Returns a list of actions that the main loop should execute.
-    pub fn poll(&self, tree: &SupervisorTree) -> Vec<ControlAction> {
-        let mut actions = Vec::new();
-
+    /// Dispatch each action before answering another request about its worker.
+    pub fn next_action(&self, tree: &SupervisorTree) -> Option<ControlAction> {
         loop {
             match self.listener.accept() {
                 Ok((stream, _)) => match handle_connection(stream, tree, self.root.as_deref()) {
-                    Ok(Some(action)) => actions.push(action),
+                    Ok(Some(action)) => return Some(action),
                     Ok(None) => {}
                     Err(e) => {
                         tracing::debug!("control connection error: {e}");
@@ -67,7 +66,7 @@ impl ControlServer {
             }
         }
 
-        actions
+        None
     }
 }
 
@@ -148,18 +147,19 @@ fn handle_request(
                 )
             }
         }
-        MessageBody::StopService { name } => {
-            if tree.get_worker(&name).is_some() {
+        MessageBody::StopService { name } => match tree.get_worker(&name) {
+            // An active remain-after-exit oneshot still needs its stop-exec.
+            Some(w) if w.pid.is_some() || w.state == ServiceState::Exited => {
                 (MessageBody::Ack, Some(ControlAction::StopService(name)))
-            } else {
-                (
-                    MessageBody::Error {
-                        message: format!("unknown service: {name}"),
-                    },
-                    None,
-                )
             }
-        }
+            Some(_) => (MessageBody::AlreadyStopped, None),
+            None => (
+                MessageBody::Error {
+                    message: format!("unknown service: {name}"),
+                },
+                None,
+            ),
+        },
         MessageBody::RestartService { name } => {
             if tree.get_worker(&name).is_some() {
                 (MessageBody::Ack, Some(ControlAction::RestartService(name)))
@@ -285,4 +285,45 @@ fn format_tree(tree: &SupervisorTree, node_id: &str, depth: usize) -> String {
     }
 
     output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::supervisor::RestartStrategy;
+    use crate::supervisor::intensity::RestartIntensity;
+    use std::time::Duration;
+
+    #[test]
+    fn stop_only_dispatches_for_an_active_service() {
+        let mut tree = SupervisorTree::new(
+            "root",
+            RestartStrategy::OneForOne,
+            RestartIntensity::new(3, Duration::from_secs(60)),
+        );
+        let def = toml::from_str("[service]\nname = 'svc'\nexec = ['/bin/true']").unwrap();
+        tree.add_worker(def, "root").unwrap();
+        let stop = |tree: &SupervisorTree| {
+            handle_request(MessageBody::StopService { name: "svc".into() }, tree, None)
+        };
+        assert!(matches!(stop(&tree), (MessageBody::AlreadyStopped, None)));
+        tree.register_pid("svc", 42);
+        assert!(matches!(
+            stop(&tree),
+            (MessageBody::Ack, Some(ControlAction::StopService(_)))
+        ));
+        tree.unregister_pid(42);
+        let w = tree.get_worker_mut("svc").unwrap();
+        w.pid = None;
+        w.state = ServiceState::Failed {
+            exit_code: Some(1),
+            signal: None,
+        };
+        assert!(matches!(stop(&tree), (MessageBody::AlreadyStopped, None)));
+        tree.get_worker_mut("svc").unwrap().state = ServiceState::Exited;
+        assert!(matches!(
+            stop(&tree),
+            (MessageBody::Ack, Some(ControlAction::StopService(_)))
+        ));
+    }
 }

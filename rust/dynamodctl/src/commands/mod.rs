@@ -35,6 +35,10 @@ pub fn stop(socket_path: &str, name: &str) -> Result {
             println!("Stopping service '{name}'...");
             Ok(())
         }
+        MessageBody::AlreadyStopped => {
+            println!("Service '{name}' was not running.");
+            Ok(())
+        }
         MessageBody::Error { message } => Err(message.into()),
         _ => Err("unexpected response".into()),
     }

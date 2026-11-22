@@ -90,6 +90,8 @@ pub enum MessageBody {
     ServiceByPid { name: Option<String>, pid: i32 },
     /// Response to DescribeService.
     ServiceDetails(ServiceDetails),
+    /// Stop succeeded without an active service to stop.
+    AlreadyStopped,
 }
 
 /// Everything `dynamodctl status` / `systemctl status` shows about a service.

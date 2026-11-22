@@ -55,6 +55,7 @@ pub fn set_enabled(ctx: &mut Ctx, names: &[String], enable: bool, now: bool, qui
             let action = if enable { "start" } else { "stop" };
             match ctx.backend.request(body) {
                 Ok(MessageBody::Ack) => {}
+                Ok(MessageBody::AlreadyStopped) if !enable => {}
                 Ok(MessageBody::Error { message }) => {
                     complain!(ctx, "Failed to {action} '{name}': {message}");
                     rc = 1;

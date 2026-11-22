@@ -466,6 +466,7 @@ fn start_stop(ctx: &mut Ctx, verb: &str, name: &str) -> i32 {
     };
     match ctx.backend.request(body) {
         Ok(MessageBody::Ack) => 0,
+        Ok(MessageBody::AlreadyStopped) if verb == "stop" => 0,
         Ok(MessageBody::Error { message }) => {
             complain!(ctx, "Failed to {action} {name}.service: {message}");
             if message.starts_with("unknown service") {

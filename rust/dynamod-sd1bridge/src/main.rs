@@ -91,7 +91,7 @@ impl SvmgrClient {
 
     pub async fn stop_service(&mut self, name: &str) -> Result<(), String> {
         match self.send_command(MessageBody::StopService { name: name.to_string() }).await? {
-            MessageBody::Ack => Ok(()),
+            MessageBody::Ack | MessageBody::AlreadyStopped => Ok(()),
             MessageBody::Error { message } => Err(message),
             _ => Err("unexpected response".to_string()),
         }

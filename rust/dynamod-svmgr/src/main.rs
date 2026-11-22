@@ -282,7 +282,7 @@ fn main() {
         // Accept dynamodctl connections during startup (listener is non-blocking).
         if let Some(ref server) = control_server {
             dispatch_control_actions(
-                server.poll(&tree),
+                server,
                 &mut tree,
                 &mut rt,
                 &cgroup_hierarchy,
@@ -334,7 +334,7 @@ fn main() {
         // Handle control socket requests
         if let Some(ref server) = control_server {
             dispatch_control_actions(
-                server.poll(&tree),
+                server,
                 &mut tree,
                 &mut rt,
                 &cgroup_hierarchy,
@@ -563,7 +563,7 @@ fn perform_shutdown(
 }
 
 fn dispatch_control_actions(
-    actions: Vec<ipc::control::ControlAction>,
+    server: &ipc::control::ControlServer,
     tree: &mut SupervisorTree,
     rt: &mut Runtime,
     cgroup_hierarchy: &CgroupHierarchy,
@@ -572,7 +572,7 @@ fn dispatch_control_actions(
 ) {
     use ipc::control::ControlAction;
 
-    for action in actions {
+    while let Some(action) = server.next_action(tree) {
         match action {
             ControlAction::StartService(name) => {
                 let active = tree
